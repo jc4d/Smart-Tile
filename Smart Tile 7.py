@@ -1103,15 +1103,15 @@ class MESH_OT_sync_tile_settings(Operator):
         source_obj = context.active_object
         src_props = source_obj.smart_tile_props
         
-        # Properties to synchronize
+        # 1. ADD your custom object property name to this list
         props_to_sync = [
             "pattern", "width", "length", "depth", "rotation_angle",
             "row_offset", "max_random_offset", "random_offset_seed",
             "width_gap", "length_gap", "uv_random_seed", "flip_mode",
-            "random_depth", "random_depth_seed", "offset_x", "offset_y", "offset_z"
+            "random_depth", "random_depth_seed", "offset_x", "offset_y", "offset_z",
+            "custom_tile_object" # <--- REPLACE with your actual variable name
         ]
         
-        # Identify valid targets
         targets = [
             obj for obj in context.selected_objects 
             if obj != source_obj and 
@@ -1123,27 +1123,32 @@ class MESH_OT_sync_tile_settings(Operator):
             self.report({'WARNING'}, "No other valid tile batches selected")
             return {'CANCELLED'}
 
-        # 1. SUSPEND all updates
         _suspend_realtime_update = True
         
         try:
-            # 2. COPY properties to all targets
             for obj in targets:
                 target_props = obj.smart_tile_props
                 for prop in props_to_sync:
+                    # Sync the reference
                     setattr(target_props, prop, getattr(src_props, prop))
+                
+                # If it's custom, ensure the link is established
+                if target_props.pattern == 'CUSTOM':
+                    # Call the logic that handles custom tile assignment
+                    # Use the method name exactly as defined in your PropertyGroup
+                    if hasattr(target_props, 'update_pattern_defaults'):
+                        target_props.update_pattern_defaults(context)
             
-            # 3. MANUALLY trigger update for each target
-            # Since we suspended the callback, we must now call the update logic
-            # for each object individually.
             for obj in targets:
+                context.view_layer.objects.active = obj
                 _perform_tile_update(context, obj)
                 
+            context.view_layer.objects.active = source_obj
+                
         finally:
-            # 4. ALWAYS re-enable updates
             _suspend_realtime_update = False
         
-        self.report({'INFO'}, f"Synced {len(targets)} tiles to match '{source_obj.name}'")
+        self.report({'INFO'}, f"Synced {len(targets)} tiles.")
         return {'FINISHED'}
 
 # ---------------------------------------------------------------------------
