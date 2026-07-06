@@ -1084,6 +1084,68 @@ class SMARTTILE_OT_update(Operator):
             return {'CANCELLED'}
         return {'FINISHED'}
 
+class MESH_OT_sync_tile_settings(Operator):
+    """Synchronize tile settings from the active object to all other selected tile batches"""
+    bl_idname = "mesh.sync_tile_settings"
+    bl_label = "Sync All Selected"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        active = context.active_object
+        return (active is not None and 
+                hasattr(active, "smart_tile_props") and 
+                active.smart_tile_props.is_tile_batch and 
+                len(context.selected_objects) > 1)
+
+    def execute(self, context):
+        global _suspend_realtime_update
+        source_obj = context.active_object
+        src_props = source_obj.smart_tile_props
+        
+        # Properties to synchronize
+        props_to_sync = [
+            "pattern", "width", "length", "depth", "rotation_angle",
+            "row_offset", "max_random_offset", "random_offset_seed",
+            "width_gap", "length_gap", "uv_random_seed", "flip_mode",
+            "random_depth", "random_depth_seed", "offset_x", "offset_y", "offset_z"
+        ]
+        
+        # Identify valid targets
+        targets = [
+            obj for obj in context.selected_objects 
+            if obj != source_obj and 
+            hasattr(obj, "smart_tile_props") and 
+            obj.smart_tile_props.is_tile_batch
+        ]
+        
+        if not targets:
+            self.report({'WARNING'}, "No other valid tile batches selected")
+            return {'CANCELLED'}
+
+        # 1. SUSPEND all updates
+        _suspend_realtime_update = True
+        
+        try:
+            # 2. COPY properties to all targets
+            for obj in targets:
+                target_props = obj.smart_tile_props
+                for prop in props_to_sync:
+                    setattr(target_props, prop, getattr(src_props, prop))
+            
+            # 3. MANUALLY trigger update for each target
+            # Since we suspended the callback, we must now call the update logic
+            # for each object individually.
+            for obj in targets:
+                _perform_tile_update(context, obj)
+                
+        finally:
+            # 4. ALWAYS re-enable updates
+            _suspend_realtime_update = False
+        
+        self.report({'INFO'}, f"Synced {len(targets)} tiles to match '{source_obj.name}'")
+        return {'FINISHED'}
+
 # ---------------------------------------------------------------------------
 # PANEL
 # ---------------------------------------------------------------------------
@@ -1168,6 +1230,9 @@ class SMARTTILE_PT_panel(Panel):
         box.prop(settings, "attr_bevel_side")
         box.prop(settings, "attr_width_edge")
         box.prop(settings, "attr_length_edge")
+        
+        layout.separator()
+        layout.operator("mesh.sync_tile_settings", icon='COPY_ID')
 
         layout.separator()
         if is_result:
@@ -1183,6 +1248,7 @@ class SMARTTILE_PT_panel(Panel):
 
 classes = (
     SmartTileSettings,
+    MESH_OT_sync_tile_settings,
     SMARTTILE_OT_generate,
     SMARTTILE_OT_update,
     SMARTTILE_PT_panel,
@@ -1190,15 +1256,14 @@ classes = (
 
 
 def register():
-    for c in classes:
-        bpy.utils.register_class(c)
+    for cls in classes:
+        bpy.utils.register_class(cls)
     bpy.types.Object.smart_tile_props = PointerProperty(type=SmartTileSettings)
 
-
 def unregister():
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)
     del bpy.types.Object.smart_tile_props
-    for c in reversed(classes):
-        bpy.utils.unregister_class(c)
 
 
 if __name__ == "__main__":
