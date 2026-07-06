@@ -13,6 +13,7 @@ import bmesh
 import mathutils
 import math
 import random
+import json
 from bpy.props import (
     FloatProperty,
     IntProperty,
@@ -38,6 +39,40 @@ _suspend_realtime_update = False
 #  - CUSTOM tile width/length/depth treated as scale multipliers
 #  - CHEVRON padding increased so patterns fully fill selected faces)
 # ---------------------------------------------------------------------------
+
+def encode_face_data_snapshot(face_data):
+    """
+    Serializes face_data (list of (normal, [verts])) into a JSON string that
+    can be stored on the batch object's property group, so it can be
+    reused verbatim by every future update instead of being re-derived from
+    the live mesh (see face_snapshot on SmartTileSettings).
+    """
+    payload = [
+        [round(n.x, 6), round(n.y, 6), round(n.z, 6),
+         [[round(v.x, 6), round(v.y, 6), round(v.z, 6)] for v in verts]]
+        for n, verts in face_data
+    ]
+    return json.dumps(payload)
+
+
+def decode_face_data_snapshot(snapshot_str):
+    """Inverse of encode_face_data_snapshot. Returns None if empty/invalid
+    (e.g. objects generated before this feature existed), so callers can
+    fall back to the old index-based re-derivation."""
+    if not snapshot_str:
+        return None
+    try:
+        payload = json.loads(snapshot_str)
+    except (ValueError, TypeError):
+        return None
+    face_data = []
+    for entry in payload:
+        nx, ny, nz, verts = entry
+        normal = mathutils.Vector((nx, ny, nz))
+        vert_list = [mathutils.Vector((v[0], v[1], v[2])) for v in verts]
+        face_data.append((normal, vert_list))
+    return face_data
+
 
 def group_faces_by_plane(face_data):
     """
@@ -632,7 +667,7 @@ def _copy_settings(src, dst):
     _suspend_realtime_update = True
     try:
         for key in src.__annotations__.keys():
-            if key in ("is_tile_batch", "source_object", "face_indices"):
+            if key in ("is_tile_batch", "source_object", "face_indices", "face_snapshot"):
                 continue
             setattr(dst, key, getattr(src, key))
     finally:
@@ -791,6 +826,15 @@ class SmartTileSettings(PropertyGroup):
     is_tile_batch: BoolProperty(default=False)
     source_object: PointerProperty(type=bpy.types.Object)
     face_indices: StringProperty(default="")
+    # JSON snapshot of the exact (normal, verts) face_data captured at
+    # Generate time -- see encode_face_data_snapshot / decode_face_data_snapshot.
+    # This is the authoritative source for updates: re-deriving face_data
+    # from the live mesh on every update (via face_indices + a fresh bmesh)
+    # was what made grouping/normals fragile, since a freshly-built bmesh
+    # isn't guaranteed to match the live edit-mode bmesh used at Generate
+    # time bit-for-bit. Storing the real snapshot once removes that
+    # dependency entirely -- every update reuses precisely what Generate saw.
+    face_snapshot: StringProperty(default="")
 
     pattern: EnumProperty(
         items=PATTERN_ITEMS, 
@@ -891,6 +935,9 @@ class SMARTTILE_OT_generate(Operator):
         batch_obj.smart_tile_props.source_object = obj
         batch_obj.smart_tile_props.face_indices = ",".join(str(i) for i in face_indices)
         _copy_settings(settings, batch_obj.smart_tile_props)
+        # Set AFTER _copy_settings (which must never include face_snapshot in
+        # its copy) so this can't be silently overwritten again.
+        batch_obj.smart_tile_props.face_snapshot = encode_face_data_snapshot(face_data)
 
         batch_obj.select_set(True)
         obj.select_set(True)
@@ -908,11 +955,6 @@ def _perform_tile_update(context, batch_obj):
 
     if src_obj is None or src_obj.name not in bpy.data.objects:
         return False, "Source object no longer exists"
-
-    try:
-        idx_list = [int(i) for i in settings.face_indices.split(",") if i]
-    except ValueError:
-        return False, "Stored face indices are corrupted"
 
     # 1. PRESERVE EXISTING STATE
     # create_tile_batch below creates + deletes a temp object per plane-group
@@ -943,17 +985,33 @@ def _perform_tile_update(context, batch_obj):
         modifier_data.append((mod.name, mod.type, mod_props))
 
     # 2. GENERATE NEW MESH
-    bm_src = bmesh.new()
-    bm_src.from_mesh(src_obj.data)
-    bm_src.faces.ensure_lookup_table()
-    try:
-        sel_faces = [bm_src.faces[i] for i in idx_list]
-    except IndexError:
-        bm_src.free()
-        return False, "Source mesh topology changed"
+    # Prefer the exact snapshot captured at Generate time -- this is what
+    # actually fixes the update-only grouping/normal glitches, since it means
+    # update never has to re-derive face_data from the live mesh at all, and
+    # therefore can't disagree with what Generate originally saw. Only fall
+    # back to re-deriving from the mesh (via the stored face indices) for
+    # objects generated before this snapshot existed.
+    face_data = decode_face_data_snapshot(settings.face_snapshot)
+    if face_data is None:
+        try:
+            idx_list = [int(i) for i in settings.face_indices.split(",") if i]
+        except ValueError:
+            return False, "Stored face indices are corrupted"
 
-    face_data = [(f.normal.copy(), [v.co.copy() for v in f.verts]) for f in sel_faces]
-    bm_src.free()
+        bm_src = bmesh.new()
+        bm_src.from_mesh(src_obj.data)
+        bm_src.normal_update()
+        bm_src.faces.ensure_lookup_table()
+        try:
+            sel_faces = [bm_src.faces[i] for i in idx_list]
+        except IndexError:
+            bm_src.free()
+            return False, "Source mesh topology changed"
+
+        face_data = [(f.normal.copy(), [v.co.copy() for v in f.verts]) for f in sel_faces]
+        bm_src.free()
+        # Backfill the snapshot so subsequent updates use it directly.
+        settings.face_snapshot = encode_face_data_snapshot(face_data)
 
     custom_name = settings.custom_tile_object.name if settings.custom_tile_object else ""
     me_batch = create_tile_batch(
