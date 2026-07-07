@@ -889,62 +889,72 @@ class SMARTTILE_OT_generate(Operator):
     def poll(cls, context):
         obj = context.active_object
         return obj is not None and obj.type == 'MESH' and obj.mode == 'EDIT'
-
+    
     def execute(self, context):
-        obj = context.active_object
-        settings = obj.smart_tile_props
-
-        bm_src = bmesh.from_edit_mesh(obj.data)
-        sel_faces = [f for f in bm_src.faces if f.select]
-        if not sel_faces:
-            self.report({'WARNING'}, "No faces selected")
+        # 1. Identify all valid, selected mesh objects
+        selected_meshes = [obj for obj in context.selected_objects if obj.type == 'MESH']
+        
+        if not selected_meshes:
+            self.report({'WARNING'}, "No mesh objects selected")
             return {'CANCELLED'}
 
-        if settings.pattern == 'CUSTOM' and settings.custom_tile_object is None:
-            self.report({'WARNING'}, "Pick a Custom Tile Object first")
-            return {'CANCELLED'}
+        # 2. Iterate through each selected object
+        for obj in selected_meshes:
+            # Ensure the object is in EDIT mode to get face data
+            if obj.mode != 'EDIT':
+                context.view_layer.objects.active = obj
+                bpy.ops.object.mode_set(mode='EDIT')
+            
+            settings = obj.smart_tile_props
+            bm_src = bmesh.from_edit_mesh(obj.data)
+            sel_faces = [f for f in bm_src.faces if f.select]
+            
+            if not sel_faces:
+                continue # Skip objects with no selected faces
 
-        face_indices = [f.index for f in sel_faces]
-        face_data = [(f.normal.copy(), [v.co.copy() for v in f.verts]) for f in sel_faces]
+            if settings.pattern == 'CUSTOM' and settings.custom_tile_object is None:
+                self.report({'WARNING'}, f"Pick a Custom Tile Object for {obj.name}")
+                continue
 
-        bpy.ops.object.mode_set(mode='OBJECT')
+            face_indices = [f.index for f in sel_faces]
+            face_data = [(f.normal.copy(), [v.co.copy() for v in f.verts]) for f in sel_faces]
 
-        custom_name = settings.custom_tile_object.name if settings.custom_tile_object else ""
-        me_batch = create_tile_batch(
-            face_data, settings.width, settings.length, settings.depth,
-            math.degrees(settings.rotation_angle), settings.row_offset, settings.max_random_offset,
-            settings.pattern, settings.width_gap, settings.length_gap,
-            settings.offset_x, settings.offset_y, settings.offset_z,
-            uv_random_seed=settings.uv_random_seed,
-            random_offset_seed=settings.random_offset_seed,
-            flip_mode=settings.flip_mode,
-            random_depth=settings.random_depth,
-            random_depth_seed=settings.random_depth_seed,
-            custom_obj_name=custom_name,
-            obj_matrix_world=obj.matrix_world,
-        )
+            # Move to object mode to generate the batch
+            bpy.ops.object.mode_set(mode='OBJECT')
 
-        batch_obj = bpy.data.objects.new("BatchTile", me_batch)
-        context.collection.objects.link(batch_obj)
-        batch_obj.matrix_world = obj.matrix_world
+            custom_name = settings.custom_tile_object.name if settings.custom_tile_object else ""
+            me_batch = create_tile_batch(
+                face_data, settings.width, settings.length, settings.depth,
+                math.degrees(settings.rotation_angle), settings.row_offset, settings.max_random_offset,
+                settings.pattern, settings.width_gap, settings.length_gap,
+                settings.offset_x, settings.offset_y, settings.offset_z,
+                uv_random_seed=settings.uv_random_seed,
+                random_offset_seed=settings.random_offset_seed,
+                flip_mode=settings.flip_mode,
+                random_depth=settings.random_depth,
+                random_depth_seed=settings.random_depth_seed,
+                custom_obj_name=custom_name,
+                obj_matrix_world=obj.matrix_world,
+            )
 
-        _finalize_batch_mesh(batch_obj, settings.depth)
+            batch_obj = bpy.data.objects.new(f"BatchTile_{obj.name}", me_batch)
+            context.collection.objects.link(batch_obj)
+            batch_obj.matrix_world = obj.matrix_world
 
-        # store the settings ON the generated object -- this is the memory.
-        batch_obj.smart_tile_props.is_tile_batch = True
-        batch_obj.smart_tile_props.source_object = obj
-        batch_obj.smart_tile_props.face_indices = ",".join(str(i) for i in face_indices)
-        _copy_settings(settings, batch_obj.smart_tile_props)
-        # Set AFTER _copy_settings (which must never include face_snapshot in
-        # its copy) so this can't be silently overwritten again.
-        batch_obj.smart_tile_props.face_snapshot = encode_face_data_snapshot(face_data)
+            _finalize_batch_mesh(batch_obj, settings.depth)
 
-        batch_obj.select_set(True)
-        obj.select_set(True)
-        context.view_layer.objects.active = obj
-        bpy.ops.object.mode_set(mode='EDIT')
+            # Store the settings and metadata
+            batch_obj.smart_tile_props.is_tile_batch = True
+            batch_obj.smart_tile_props.source_object = obj
+            batch_obj.smart_tile_props.face_indices = ",".join(str(i) for i in face_indices)
+            _copy_settings(settings, batch_obj.smart_tile_props)
+            batch_obj.smart_tile_props.face_snapshot = encode_face_data_snapshot(face_data)
+
+            # Keep the original object selected
+            batch_obj.select_set(False)
+            obj.select_set(True)
+
         return {'FINISHED'}
-
 
 def _perform_tile_update(context, batch_obj):
     """Regenerate an existing tile-batch object from its currently stored
