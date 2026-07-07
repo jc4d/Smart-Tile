@@ -98,7 +98,17 @@ def get_pattern_offset(pos, axis_u, axis_v, normal, offset_x, offset_y, offset_z
 def set_tile_edge_attributes(bm, depth, attr_names):
     """
     attr_names is a dictionary mapping logical roles to the string names 
-    stored in your UI properties.
+    stored in your UI properties. attr_names["boolean"] is the name used
+    for the new boolean-cut edge marker attribute.
+
+    Faces that belong to the original, pristine (pre-clip) tile geometry
+    carry a temporary "_orig_tile_face" marker (written in create_tile_batch,
+    before the per-group boolean clip runs). Faces contributed by the
+    clip-cutter itself never had that marker, so any edge touching one of
+    those faces is, by definition, an edge born from the boolean clip
+    rather than a genuine tile edge. We use that to keep clip-boundary
+    edges out of top/bottom/side/width/length entirely, and tag them with
+    their own "boolean" attribute instead.
     """
     # Clean up any existing layers with the current target names
     for key, name in attr_names.items():
@@ -113,31 +123,55 @@ def set_tile_edge_attributes(bm, depth, attr_names):
     lu = bm.faces.layers.float_vector.get("tile_axis_u")
     lv = bm.faces.layers.float_vector.get("tile_axis_v")
 
+    orig_face_marker = bm.faces.layers.float.get("_orig_tile_face")
+
+    # Safety net: if the marker didn't survive the boolean clip at all
+    # (e.g. a future Blender version stops propagating this generic
+    # attribute through the modifier), silently fall back to the old
+    # behaviour instead of accidentally zeroing out every edge attribute.
+    if orig_face_marker is not None:
+        marked = sum(1 for f in bm.faces if f[orig_face_marker] >= 0.5)
+        if marked == 0:
+            orig_face_marker = None
+
     for edge in bm.edges:
         linked = edge.link_faces
         if not linked: continue
+
+        is_boolean_edge = False
+        if orig_face_marker is not None:
+            is_boolean_edge = any(f[orig_face_marker] < 0.5 for f in linked)
+
         is_top = is_bot = is_width_edge = is_length_edge = False
-        
-        if l_normal:
-            for f in linked:
-                tile_normal = mathutils.Vector(f[l_normal]).normalized()
-                dot = f.normal.normalized().dot(tile_normal)
-                if dot > 0.9: is_top = True
-                elif dot < -0.9: is_bot = True
-        
-        if is_top and lu and lv:
-            cap_face = next((f for f in linked if f.normal.normalized().dot(mathutils.Vector(f[l_normal]).normalized()) > 0.9), None)
-            if cap_face:
-                axis_u, axis_v = mathutils.Vector(cap_face[lu]), mathutils.Vector(cap_face[lv])
-                vec = (edge.verts[0].co - edge.verts[1].co).normalized()
-                is_width_edge = abs(vec.dot(axis_u)) > 0.9
-                is_length_edge = abs(vec.dot(axis_v)) > 0.9
-        
+
+        if not is_boolean_edge:
+            if l_normal:
+                for f in linked:
+                    tile_normal = mathutils.Vector(f[l_normal]).normalized()
+                    dot = f.normal.normalized().dot(tile_normal)
+                    if dot > 0.9: is_top = True
+                    elif dot < -0.9: is_bot = True
+
+            if is_top and lu and lv:
+                cap_face = next((f for f in linked if f.normal.normalized().dot(mathutils.Vector(f[l_normal]).normalized()) > 0.9), None)
+                if cap_face:
+                    axis_u, axis_v = mathutils.Vector(cap_face[lu]), mathutils.Vector(cap_face[lv])
+                    vec = (edge.verts[0].co - edge.verts[1].co).normalized()
+                    is_width_edge = abs(vec.dot(axis_u)) > 0.9
+                    is_length_edge = abs(vec.dot(axis_v)) > 0.9
+
         edge[layers["top"]] = 1.0 if is_top else 0.0
         edge[layers["bottom"]] = 1.0 if is_bot else 0.0
-        edge[layers["side"]] = 1.0 if not (is_top or is_bot) else 0.0
+        edge[layers["side"]] = 1.0 if (not is_boolean_edge and not (is_top or is_bot)) else 0.0
         edge[layers["width"]] = 1.0 if is_width_edge else 0.0
         edge[layers["length"]] = 1.0 if is_length_edge else 0.0
+        if "boolean" in layers:
+            edge[layers["boolean"]] = 1.0 if is_boolean_edge else 0.0
+
+    # Drop the temporary face marker -- it's only needed inside this pass,
+    # not as a permanent attribute on the finished object.
+    if orig_face_marker is not None:
+        bm.faces.layers.float.remove(orig_face_marker)
 
 
 def get_stretcher_matrices(groups, width, length, depth, rot_rad, row_offset, staggered_offset, max_random_offset,
@@ -574,6 +608,14 @@ def create_tile_batch(face_data, width, length, depth, rotation_angle, row_offse
                     new_f.loops[li][g_uv].uv = loop[t_uv].uv
                 new_f[g_tile_normal], new_f[g_axis_u], new_f[g_axis_v] = normal, axis_u, axis_v
 
+        # Mark every face of this pristine (un-clipped) tile mesh so that,
+        # after the boolean clip below, set_tile_edge_attributes() can tell
+        # genuine tile edges apart from the new boundary edges the clip-cutter
+        # introduces (those new faces never get this marker).
+        g_orig_face = group_bm.faces.layers.float.new("_orig_tile_face")
+        for f in group_bm.faces:
+            f[g_orig_face] = 1.0
+
         group_mesh = bpy.data.meshes.new("_tile_group_tmp")
         group_bm.to_mesh(group_mesh)
         group_bm.free()
@@ -615,6 +657,7 @@ def _finalize_batch_mesh(batch_obj, depth):
         "side": settings.attr_bevel_side,
         "width": settings.attr_width_edge,
         "length": settings.attr_length_edge,
+        "boolean": settings.attr_boolean_edge,
     }
     
     # 3. Apply edge attributes using the collected names
@@ -858,6 +901,7 @@ class SmartTileSettings(PropertyGroup):
     attr_bevel_side: StringProperty(name="Side Bevel", default="bevel_side", update=_trigger_realtime_update)
     attr_width_edge: StringProperty(name="Width Edge", default="top_width_edge", update=_trigger_realtime_update)
     attr_length_edge: StringProperty(name="Length Edge", default="top_length_edge", update=_trigger_realtime_update)
+    attr_boolean_edge: StringProperty(name="Boolean Cut Edge", default="boolean_edge", update=_trigger_realtime_update)
 
     def _poll_custom_tile_object(self, obj):
         return obj.type == 'MESH' and not obj.smart_tile_props.is_tile_batch
@@ -1241,6 +1285,7 @@ class SMARTTILE_PT_panel(Panel):
         box.prop(settings, "attr_bevel_side")
         box.prop(settings, "attr_width_edge")
         box.prop(settings, "attr_length_edge")
+        box.prop(settings, "attr_boolean_edge")
         
         layout.separator()
         layout.operator("mesh.sync_tile_settings", icon='COPY_ID')
