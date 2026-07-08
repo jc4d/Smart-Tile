@@ -525,35 +525,62 @@ def _clip_mesh_to_faces(mesh, faces, obj_matrix_world, depth, offset_z):
 def create_tile_batch(face_data, width, length, depth, rotation_angle, row_offset, staggered_offset, max_random_offset,
                        pattern, width_gap, length_gap, offset_x, offset_y, offset_z, uv_random_seed=0,
                        random_offset_seed=0, flip_mode="BOTH", random_depth=0.0, random_depth_seed=0,
-                       custom_obj_name="CustomTileTemplate", obj_matrix_world=None):
+                       custom_obj_name="CustomTileTemplate", obj_matrix_world=None, preserve_uv=False):
     templates = {}
     u_options = [False, True] if flip_mode in ["BOTH", "U"] else [False]
     v_options = [False, True] if flip_mode in ["BOTH", "V"] else [False]
 
+    # CUSTOM tile + "Preserve Source UVs": reuse the custom object's own
+    # authored UV map instead of the generic box-projection below. The
+    # per-tile random mirroring (flip_mode/uv_random_seed) still applies --
+    # it's just done by mirroring the *real* UV coordinates (u' = 1-u /
+    # v' = 1-v) rather than recomputing UVs from local vertex position.
+    # Resolved once here (not per flip-combo) so a missing-UV fallback is
+    # only reported/decided a single time.
+    custom_src_obj = bpy.data.objects.get(custom_obj_name) if pattern == "CUSTOM" else None
+    src_uv_name = None
+    uv_fallback_warning = None
+    if preserve_uv and custom_src_obj is not None:
+        active_uv = custom_src_obj.data.uv_layers.active
+        if active_uv:
+            src_uv_name = active_uv.name
+        else:
+            uv_fallback_warning = (
+                f"'{custom_src_obj.name}' has no UV map -- Preserve Source UVs "
+                f"fell back to automatic box-projected UVs."
+            )
+
     for flip_u in u_options:
         for flip_v in v_options:
             bm = bmesh.new()
-            if pattern == "CUSTOM" and bpy.data.objects.get(custom_obj_name):
-                src_obj = bpy.data.objects[custom_obj_name]
+            if custom_src_obj is not None:
+                src_obj = custom_src_obj
                 bm.from_mesh(src_obj.data)
             else:
                 bmesh.ops.create_cube(bm, size=1.0)
 
             # Explicitly get or create the UV map named "UVMap"
             uv_layer = bm.loops.layers.uv.get("UVMap") or bm.loops.layers.uv.new("UVMap")
-            
+            # Only set (and only looked up per-template-bm, since each is a
+            # fresh bm.from_mesh copy) when preserve_uv resolved a real layer.
+            src_uv_layer = bm.loops.layers.uv.get(src_uv_name) if src_uv_name else None
+
             for f in bm.faces:
                 is_top = f.normal.z > 0.9
                 is_bot = f.normal.z < -0.9
                 for loop in f.loops:
-                    co = loop.vert.co
-                    u = (1.0 - (co.x + 0.5)) if flip_u else (co.x + 0.5)
-                    v = (1.0 - (co.y + 0.5)) if flip_v else (co.y + 0.5)
-                    if is_top or is_bot:
-                        loop[uv_layer].uv = (u, v)
+                    if src_uv_layer is not None:
+                        src_u, src_v = loop[src_uv_layer].uv
+                        u = (1.0 - src_u) if flip_u else src_u
+                        v = (1.0 - src_v) if flip_v else src_v
                     else:
-                        u_coord = (co.y + 0.5) if abs(f.normal.x) > 0.5 else (co.x + 0.5)
-                        loop[uv_layer].uv = (u_coord, co.z + 0.5)
+                        co = loop.vert.co
+                        u = (1.0 - (co.x + 0.5)) if flip_u else (co.x + 0.5)
+                        v = (1.0 - (co.y + 0.5)) if flip_v else (co.y + 0.5)
+                        if not (is_top or is_bot):
+                            u = (co.y + 0.5) if abs(f.normal.x) > 0.5 else (co.x + 0.5)
+                            v = co.z + 0.5
+                    loop[uv_layer].uv = (u, v)
             templates[(flip_u, flip_v)] = bm
 
     template_z_mid = {}
@@ -630,7 +657,7 @@ def create_tile_batch(face_data, width, length, depth, rotation_angle, row_offse
     me_batch = bpy.data.meshes.new("BatchTile")
     master_bm.to_mesh(me_batch)
     master_bm.free()
-    return me_batch
+    return me_batch, uv_fallback_warning
 
 
 def _finalize_batch_mesh(batch_obj, depth):
@@ -913,6 +940,17 @@ class SmartTileSettings(PropertyGroup):
         description="Mesh object to use as the repeating tile",
         poll=_poll_custom_tile_object,
     )
+    preserve_custom_uv: BoolProperty(
+        name="Preserve Source UVs",
+        default=False,
+        update=_trigger_realtime_update,
+        description=(
+            "Keep the Custom Tile Object's own UV mapping instead of the "
+            "automatic box-projected UVs. Per-tile random UV mirroring "
+            "(Flip Mode) still applies on top of the preserved UVs. Falls "
+            "back to box-projected UVs if the object has no UV map"
+        ),
+    )
 
 # ---------------------------------------------------------------------------
 # OPERATORS
@@ -965,7 +1003,7 @@ class SMARTTILE_OT_generate(Operator):
             bpy.ops.object.mode_set(mode='OBJECT')
 
             custom_name = settings.custom_tile_object.name if settings.custom_tile_object else ""
-            me_batch = create_tile_batch(
+            me_batch, uv_warning = create_tile_batch(
                 face_data, settings.width, settings.length, settings.depth, 
                 math.degrees(settings.rotation_angle), settings.row_offset, settings.staggered_offset,
                 settings.max_random_offset, settings.pattern, settings.width_gap, 
@@ -973,8 +1011,10 @@ class SMARTTILE_OT_generate(Operator):
                 uv_random_seed=settings.uv_random_seed, random_offset_seed=settings.random_offset_seed, 
                 flip_mode=settings.flip_mode, random_depth=settings.random_depth, 
                 random_depth_seed=settings.random_depth_seed, custom_obj_name=custom_name, 
-                obj_matrix_world=obj.matrix_world,
+                obj_matrix_world=obj.matrix_world, preserve_uv=settings.preserve_custom_uv,
             )
+            if uv_warning:
+                self.report({'WARNING'}, uv_warning)
 
             batch_obj = bpy.data.objects.new(f"BatchTile_{obj.name}", me_batch)
             context.collection.objects.link(batch_obj)
@@ -1069,7 +1109,7 @@ def _perform_tile_update(context, batch_obj):
         settings.face_snapshot = encode_face_data_snapshot(face_data)
 
     custom_name = settings.custom_tile_object.name if settings.custom_tile_object else ""
-    me_batch = create_tile_batch(
+    me_batch, uv_warning = create_tile_batch(
         face_data, settings.width, settings.length, settings.depth,
         math.degrees(settings.rotation_angle), settings.row_offset, settings.staggered_offset, settings.max_random_offset,
         settings.pattern, settings.width_gap, settings.length_gap,
@@ -1081,6 +1121,7 @@ def _perform_tile_update(context, batch_obj):
         random_depth_seed=settings.random_depth_seed,
         custom_obj_name=custom_name,
         obj_matrix_world=src_obj.matrix_world,
+        preserve_uv=settings.preserve_custom_uv,
     )
 
     # 3. SWAP DATA
@@ -1113,7 +1154,9 @@ def _perform_tile_update(context, batch_obj):
     if prev_active is not None and prev_active.name in bpy.data.objects:
         context.view_layer.objects.active = prev_active
 
-    return True, ""
+    # On success `message` doubles as a non-fatal warning slot (e.g. the
+    # Preserve Source UVs fallback notice) rather than an error string.
+    return True, (uv_warning or "")
 
 
 class SMARTTILE_OT_update(Operator):
@@ -1137,6 +1180,8 @@ class SMARTTILE_OT_update(Operator):
         if not ok:
             self.report({'ERROR'}, message)
             return {'CANCELLED'}
+        if message:
+            self.report({'WARNING'}, message)
         return {'FINISHED'}
 
 class MESH_OT_sync_tile_settings(Operator):
@@ -1154,18 +1199,23 @@ class MESH_OT_sync_tile_settings(Operator):
                 len(context.selected_objects) > 1)
 
     def execute(self, context):
-        global _suspend_realtime_update
         source_obj = context.active_object
         src_props = source_obj.smart_tile_props
         
+        # Identify all properties defined in the UI that should be synced
+        # This mirrors the fields found in SmartTileSettings
         props_to_sync = [
             "pattern", "width", "length", "depth", "rotation_angle",
             "row_offset", "staggered_offset", "max_random_offset", "random_offset_seed",
             "width_gap", "length_gap", "uv_random_seed", "flip_mode",
-            "random_depth", "random_depth_seed", "offset_x", "offset_y", "offset_z"
+            "random_depth", "random_depth_seed", "offset_x", "offset_y", "offset_z",
+            "attr_bevel_top", "attr_bevel_bottom", "attr_bevel_side", 
+            "attr_width_edge", "attr_length_edge", "attr_boolean_edge"
         ]
         if hasattr(src_props, "custom_tile_object"):
             props_to_sync.append("custom_tile_object")
+        if hasattr(src_props, "preserve_custom_uv"):
+            props_to_sync.append("preserve_custom_uv")
         
         targets = [obj for obj in context.selected_objects 
                    if obj != source_obj and hasattr(obj, "smart_tile_props") and obj.smart_tile_props.is_tile_batch]
@@ -1174,29 +1224,16 @@ class MESH_OT_sync_tile_settings(Operator):
             self.report({'WARNING'}, "No other valid tile batches selected")
             return {'CANCELLED'}
 
-        _suspend_realtime_update = True
-        try:
-            for obj in targets:
-                target_props = obj.smart_tile_props
-                for prop in props_to_sync:
-                    setattr(target_props, prop, getattr(src_props, prop))
-                
-                # IMPORTANT: Clear the stale snapshot so _perform_tile_update 
-                # is forced to re-derive the face data from the live source mesh
-                target_props.face_snapshot = "" 
-                
-                if target_props.pattern == 'CUSTOM' and hasattr(target_props, 'update_pattern_defaults'):
-                    target_props.update_pattern_defaults(context)
-            
-            for obj in targets:
-                context.view_layer.objects.active = obj
-                _perform_tile_update(context, obj)
-                
-            context.view_layer.objects.active = source_obj
-        finally:
-            _suspend_realtime_update = False
+        # Bulk transfer properties only. 
+        # By not touching _perform_tile_update or snapshots, we rely on the 
+        # property 'update' callbacks (via _trigger_realtime_update) 
+        # to handle the regeneration naturally.
+        for obj in targets:
+            target_props = obj.smart_tile_props
+            for prop in props_to_sync:
+                setattr(target_props, prop, getattr(src_props, prop))
         
-        self.report({'INFO'}, f"Synced and refreshed {len(targets)} tiles.")
+        self.report({'INFO'}, f"Synced settings to {len(targets)} tiles.")
         return {'FINISHED'}
 
 # ---------------------------------------------------------------------------
@@ -1237,6 +1274,7 @@ class SMARTTILE_PT_panel(Panel):
             layout.prop(settings, "custom_tile_object")
             if settings.custom_tile_object is None:
                 layout.label(text="Pick an object above", icon='ERROR')
+            layout.prop(settings, "preserve_custom_uv")
 
         col = layout.column(align=True)
         if settings.pattern == 'CUSTOM':
