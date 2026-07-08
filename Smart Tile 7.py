@@ -1,10 +1,10 @@
 bl_info = {
     "name": "Smart Tile Generator",
     "author": "You",
-    "version": (1, 0, 0),
+    "version": (1, 2, 0),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar > Tile Gen",
-    "description": "Procedural tile pattern generator (Stretcher, Herringbone, Chevron, Windmill, Custom) with per-object remembered parameters",
+    "description": "Procedural tile pattern generator with optimized per-row dynamic bounds and percentage-based offsets",
     "category": "Mesh",
 }
 
@@ -21,14 +21,21 @@ from bpy.props import (
     StringProperty,
     BoolProperty,
     PointerProperty,
+    CollectionProperty,
 )
-from bpy.types import PropertyGroup, Operator, Panel
+from bpy.types import PropertyGroup, Operator, Panel, UIList
 
 # Guard flag: prevents realtime-update callbacks from re-entering / firing a
 # storm of regenerations while we're programmatically setting several
 # properties in a row (e.g. when the pattern dropdown changes its defaults,
 # or when settings are copied onto a freshly generated batch object).
 _suspend_realtime_update = False
+
+# Same purpose as _suspend_realtime_update, but dedicated to the material-rule
+# real-time re-application (see _trigger_material_rule_update below), kept
+# separate so a pending geometry regen and a pending material-rule re-apply
+# never suppress each other.
+_suspend_material_rule_update = False
 
 
 # ---------------------------------------------------------------------------
@@ -104,11 +111,6 @@ def _fast_tile_bool(seed, tile_idx, salt):
     small integer hash (SplitMix-style bit mixing) instead: same seed+idx
     always gives the same result (still fully deterministic/reproducible),
     but with no object-construction overhead.
-
-    Not cryptographic -- just uniform enough for a visual UV-mirroring
-    coin-flip. NOTE: this produces a DIFFERENT flip pattern than the old
-    random.Random-based version for the same uv_random_seed, so existing
-    generated tile batches will look slightly different after an Update.
     """
     x = (seed * 2654435761 + tile_idx * 2246822519 + salt * 3266489917) & 0xFFFFFFFF
     x ^= x >> 16
@@ -121,18 +123,11 @@ def _fast_tile_bool(seed, tile_idx, salt):
 
 def set_tile_edge_attributes(bm, depth, attr_names):
     """
-    attr_names is a dictionary mapping logical roles to the string names 
-    stored in your UI properties. attr_names["boolean"] is the name used
-    for the new boolean-cut edge marker attribute.
-
     Faces that belong to the original, pristine (pre-clip) tile geometry
-    carry a temporary "_orig_tile_face" marker (written in create_tile_batch,
-    before the per-group boolean clip runs). Faces contributed by the
+    carry a temporary "_orig_tile_face" marker. Faces contributed by the
     clip-cutter itself never had that marker, so any edge touching one of
     those faces is, by definition, an edge born from the boolean clip
-    rather than a genuine tile edge. We use that to keep clip-boundary
-    edges out of top/bottom/side/width/length entirely, and tag them with
-    their own "boolean" attribute instead.
+    rather than a genuine tile edge.
     """
     # Clean up any existing layers with the current target names
     for key, name in attr_names.items():
@@ -149,20 +144,12 @@ def set_tile_edge_attributes(bm, depth, attr_names):
 
     orig_face_marker = bm.faces.layers.float.get("_orig_tile_face")
 
-    # Safety net: if the marker didn't survive the boolean clip at all
-    # (e.g. a future Blender version stops propagating this generic
-    # attribute through the modifier), silently fall back to the old
-    # behaviour instead of accidentally zeroing out every edge attribute.
     if orig_face_marker is not None:
         marked = sum(1 for f in bm.faces if f[orig_face_marker] >= 0.5)
         if marked == 0:
             orig_face_marker = None
 
     # Precompute per-face data ONCE instead of inside the edge loop below.
-    # Each face is touched by ~4 edges, so without this cache the same
-    # face's normal gets normalized and dotted against tile_normal up to 4x
-    # over -- once per edge that happens to reference it. Caching turns that
-    # into a single pass over faces, and the edge loop becomes cheap lookups.
     face_cache = {}
     if l_normal:
         for f in bm.faces:
@@ -211,14 +198,12 @@ def set_tile_edge_attributes(bm, depth, attr_names):
         if "boolean" in layers:
             edge[layers["boolean"]] = 1.0 if is_boolean_edge else 0.0
 
-    # Drop the temporary face marker -- it's only needed inside this pass,
-    # not as a permanent attribute on the finished object.
     if orig_face_marker is not None:
         bm.faces.layers.float.remove(orig_face_marker)
 
 
 def get_stretcher_matrices(groups, width, length, depth, rot_rad, row_offset, staggered_offset, max_random_offset,
-                            width_gap, length_gap, random_offset_seed, offset_x, offset_y, offset_z):
+                            width_gap, length_gap, random_offset_seed, offset_x, offset_y, offset_z, tiling_axis='BOTH'):
     all_matrices = []
     stretcher_rng = random.Random(random_offset_seed)
     random_row_shifts = {}
@@ -226,7 +211,7 @@ def get_stretcher_matrices(groups, width, length, depth, rot_rad, row_offset, st
 
     for key, data in groups.items():
         normal, faces = data["normal"], data["faces"]
-        axis_u = (mathutils.Vector((0, 0, 1)) if abs(normal.dot(mathutils.Vector((0, 0, 1)))) < 0.9 else mathutils.Vector((0, 1, 0)))
+        axis_u = (mathutils.Vector((0, 0, 1)) if abs(normal.dot(mathutils.Vector((0, 0, 1))) ) < 0.9 else mathutils.Vector((0, 1, 0)))
         axis_u = (axis_u - axis_u.dot(normal) * normal).normalized()
         axis_v = normal.cross(axis_u).normalized()
         if rot_rad != 0.0:
@@ -234,30 +219,46 @@ def get_stretcher_matrices(groups, width, length, depth, rot_rad, row_offset, st
             axis_u, axis_v = rot_mat_axes @ axis_u, rot_mat_axes @ axis_v
 
         all_verts = [v for face in faces for v in face]
-        anchor = get_pattern_offset(all_verts[0], axis_u, axis_v, normal, offset_x, offset_y, offset_z)
-        projected = [((v - all_verts[0]).dot(axis_u), (v - all_verts[0]).dot(axis_v)) for v in all_verts]
+        anchor_base = all_verts[0]
+        anchor = get_pattern_offset(anchor_base, axis_u, axis_v, normal, offset_x, offset_y, offset_z)
+        projected = [((v - anchor_base).dot(axis_u), (v - anchor_base).dot(axis_v)) for v in all_verts]
         u_min, u_max = min(p[0] for p in projected), max(p[0] for p in projected)
         v_min, v_max = min(p[1] for p in projected), max(p[1] for p in projected)
 
         u_step, v_step = width + width_gap, length + length_gap
-        u_off_step, v_off_step = math.floor(offset_x / u_step), math.floor(offset_y / v_step)
-        for i in range(math.floor(u_min / u_step) - 5 - u_off_step, math.ceil(u_max / u_step) + 5 - u_off_step):
-            for j in range(math.floor(v_min / v_step) - 5 - v_off_step, math.ceil(v_max / v_step) + 5 - v_off_step):
-                if j not in random_row_shifts:
-                    random_row_shifts[j] = stretcher_rng.uniform(0, max_random_offset)
-                u_pos = (i * u_step) + (width * 0.5) + (row_offset if j % 2 != 0 else 0.0) + (j * staggered_offset) + random_row_shifts[j]
+        u_off_step = math.floor(offset_x / u_step)
+        v_off_step = math.floor(offset_y / v_step)
+        
+        # Determine strict vertical bounds
+        j_min = math.floor((v_min - offset_y) / v_step) - 1
+        j_max = math.ceil((v_max - offset_y) / v_step) + 1
+
+        for j in range(j_min, j_max):
+            if tiling_axis == 'X' and (j + v_off_step) != 0:
+                continue
+            if j not in random_row_shifts:
+                random_row_shifts[j] = stretcher_rng.uniform(0, max_random_offset)
+            
+            # Row & Stagger offsets calculated as a percentage multiplier of the tile width
+            row_shift = (row_offset * width if j % 2 != 0 else 0.0) + (j * staggered_offset * width) + random_row_shifts[j]
+            
+            # DYNAMIC OPTIMIZATION: Bounds are recalculated per row to track the shift sloped angle perfectly
+            i_min = math.floor((u_min - offset_x - row_shift - width) / u_step)
+            i_max = math.ceil((u_max - offset_x - row_shift + width) / u_step)
+
+            for i in range(i_min, i_max + 1):
+                if tiling_axis == 'Y' and (i + u_off_step) != 0:
+                    continue
+                u_pos = (i * u_step) + (width * 0.5) + row_shift
                 v_pos = (j * v_step) + (length * 0.5)
                 tile_center = anchor + (u_pos * axis_u) + (v_pos * axis_v)
-                all_matrices.append(create_tile_matrix(tile_center, axis_u, axis_v, normal, e_width, e_length, depth))
+                all_matrices.append(create_tile_matrix(tile_center, axis_u, axis_v, normal, e_width, e_length, depth) + (i, j))
     return all_matrices
 
 
 def get_herringbone_matrices(groups, width, length, depth, rot_rad, row_offset, staggered_offset, max_random_offset,
-                              width_gap, length_gap, offset_x, offset_y, offset_z):
+                              width_gap, length_gap, offset_x, offset_y, offset_z, tiling_axis='BOTH'):
     all_matrices = []
-    # Tiles are built with length running along the u-axis and width along the
-    # v-axis (see the create_tile_matrix calls below), so length_gap shrinks/
-    # shifts along u and width_gap shrinks/shifts along v.
     e_width = width - width_gap
     e_length = length - length_gap
     offset_u = length_gap / 2.0
@@ -292,26 +293,32 @@ def get_herringbone_matrices(groups, width, length, depth, rot_rad, row_offset, 
 
         row_off_step = math.floor(offset_y / row_step)
         col_off_step = math.floor(offset_x / col_step)
-        row_min = math.floor(v_min / row_step) - 2 - row_off_step
-        row_max = math.ceil(v_max / row_step) + 2 - row_off_step
-        col_min = math.floor(u_min / col_step) - 2 - col_off_step
-        col_max = math.ceil(u_max / col_step) + 2 - col_off_step
+        
+        # Tightened global grid footprint padding down to 1
+        row_min = math.floor(v_min / row_step) - 1 - row_off_step
+        row_max = math.ceil(v_max / row_step) + 1 - row_off_step
+        col_min = math.floor(u_min / col_step) - 1 - col_off_step
+        col_max = math.ceil(u_max / col_step) + 1 - col_off_step
 
         for row in range(row_min, row_max):
+            if tiling_axis == 'X' and (row + row_off_step) != 0:
+                continue
             row_origin = anchor + (row * row_step) * axis_v
             for col in range(col_min, col_max):
+                if tiling_axis == 'Y' and (col + col_off_step) != 0:
+                    continue
                 pos_a = row_origin + (col * col_step) * axis_u
                 centered_pos_a = pos_a + (offset_u * u_pos) + (offset_v * v_pos)
-                all_matrices.append(create_tile_matrix(centered_pos_a, u_pos, v_pos, normal, e_length, e_width, depth))
+                all_matrices.append(create_tile_matrix(centered_pos_a, u_pos, v_pos, normal, e_length, e_width, depth) + (col, row))
                 pos_b = pos_a + (step_u - step_v) * axis_u + (step_u - step_v) * axis_v
                 centered_pos_b = pos_b + (offset_u * u_neg) + (offset_v * v_neg)
-                all_matrices.append(create_tile_matrix(centered_pos_b, u_neg, v_neg, normal, e_length, e_width, depth))
+                all_matrices.append(create_tile_matrix(centered_pos_b, u_neg, v_neg, normal, e_length, e_width, depth) + (col, row))
 
     return all_matrices
 
 
 def get_chevron_matrices(groups, width, length, depth, rot_rad, row_offset, staggered_offset, max_random_offset,
-                          width_gap, length_gap, offset_x, offset_y, offset_z):
+                          width_gap, length_gap, offset_x, offset_y, offset_z, tiling_axis='BOTH'):
     all_matrices = []
     for key, data in groups.items():
         normal, faces = data["normal"], data["faces"]
@@ -346,32 +353,31 @@ def get_chevron_matrices(groups, width, length, depth, rot_rad, row_offset, stag
 
         row_off_step = math.floor(offset_x / row_step)
         col_off_step = math.floor(offset_y / leg_width)
-        # Chevron places two sheared tiles per cell, one shifted an extra half-row
-        # out, so its true footprint reaches further than plain length x width.
-        # Use a wider safety margin than the other patterns to avoid unfilled edges.
-        pad = 6
+        
+        # Reduced heavy flat safe padding (from 6 down to 1) to save thousands of redundant tiles
+        pad = 1
         row_min = math.floor(u_min / row_step) - pad - row_off_step
         row_max = math.ceil(u_max / row_step) + pad - row_off_step
         col_min = math.floor(v_min / leg_width) - pad - col_off_step
         col_max = math.ceil(v_max / leg_width) + pad - col_off_step
 
         for row in range(row_min, row_max):
+            if tiling_axis == 'Y' and (row + row_off_step) != 0:
+                continue
             for col in range(col_min, col_max):
-                # row_step runs along axis_u (the length direction) so it uses
-                # length_gap; leg_width runs along axis_v (the width direction)
-                # so it uses width_gap. The seam between the two chevron legs
-                # sits along the width direction too, so it also uses width_gap.
+                if tiling_axis == 'X' and (col + col_off_step) != 0:
+                    continue
                 origin = anchor + (col * (leg_width + width_gap)) * axis_v + (row * (row_step + length_gap)) * axis_u
                 mat, n, u, v = create_tile_matrix(origin, u_pos, v_pos, normal, length, width, depth)
-                all_matrices.append((mat @ shear_pos, n, u, v))
+                all_matrices.append((mat @ shear_pos, n, u, v, row, col))
                 seam_push = (v_pos - v_neg).normalized() * -(width_gap * 0.5)
                 mat, n, u, v = create_tile_matrix(origin + correction + (row_step / 2) * axis_u + seam_push, u_neg, v_neg, normal, length, width, depth)
-                all_matrices.append((mat @ shear_neg, n, u, v))
+                all_matrices.append((mat @ shear_neg, n, u, v, row, col))
     return all_matrices
 
 
 def get_windmill_matrices(groups, width, length, depth, rot_rad, row_offset, staggered_offset, max_random_offset,
-                           width_gap, length_gap, offset_x, offset_y, offset_z):
+                           width_gap, length_gap, offset_x, offset_y, offset_z, tiling_axis='BOTH'):
     all_matrices = []
     for key, data in groups.items():
         normal, faces = data["normal"], data["faces"]
@@ -393,42 +399,46 @@ def get_windmill_matrices(groups, width, length, depth, rot_rad, row_offset, sta
 
         row_off_step = math.floor(offset_x / cell)
         col_off_step = math.floor(offset_y / cell)
-        row_min = math.floor(u_min / cell) - 2 - row_off_step
-        row_max = math.ceil(u_max / cell) + 2 - row_off_step
-        col_min = math.floor(v_min / cell) - 2 - col_off_step
-        col_max = math.ceil(v_max / cell) + 2 - col_off_step
+        
+        # Tight padding buffer reduced to 1
+        row_min = math.floor(u_min / cell) - 1 - row_off_step
+        row_max = math.ceil(u_max / cell) + 1 - row_off_step
+        col_min = math.floor(v_min / cell) - 1 - col_off_step
+        col_max = math.ceil(v_max / cell) + 1 - col_off_step
 
         center_gap = (width_gap + length_gap) / 2.0
 
         for row in range(row_min, row_max):
+            if tiling_axis == 'Y' and (row + row_off_step) != 0:
+                continue
             for col in range(col_min, col_max):
+                if tiling_axis == 'X' and (col + col_off_step) != 0:
+                    continue
                 origin = anchor + (col * cell) * axis_v + (row * cell) * axis_u
-                all_matrices.append(create_tile_matrix(origin, axis_u, axis_v, normal, length - length_gap, width - width_gap, depth))
-                all_matrices.append(create_tile_matrix(origin + (length + width) * axis_u, axis_v, -axis_u, normal, length - length_gap, width - width_gap, depth))
-                all_matrices.append(create_tile_matrix(origin + width * axis_v + width * axis_u, axis_v, -axis_u, normal, length - length_gap, width - width_gap, depth))
-                all_matrices.append(create_tile_matrix(origin + length * axis_v + width * axis_u, axis_u, axis_v, normal, length - length_gap, width - width_gap, depth))
-                all_matrices.append(create_tile_matrix(origin + width * axis_v + width * axis_u, axis_u, axis_v, normal, length - width - center_gap, length - width - center_gap, depth))
+                all_matrices.append(create_tile_matrix(origin, axis_u, axis_v, normal, length - length_gap, width - width_gap, depth) + (row, col))
+                all_matrices.append(create_tile_matrix(origin + (length + width) * axis_u, axis_v, -axis_u, normal, length - length_gap, width - width_gap, depth) + (row, col))
+                all_matrices.append(create_tile_matrix(origin + width * axis_v + width * axis_u, axis_v, -axis_u, normal, length - length_gap, width - width_gap, depth) + (row, col))
+                all_matrices.append(create_tile_matrix(origin + length * axis_v + width * axis_u, axis_u, axis_v, normal, length - length_gap, width - width_gap, depth) + (row, col))
+                all_matrices.append(create_tile_matrix(origin + width * axis_v + width * axis_u, axis_u, axis_v, normal, length - width - center_gap, length - width - center_gap, depth) + (row, col))
     return all_matrices
 
 
 def get_custom_tile_matrices(groups, width, length, depth, rot_rad, row_offset, staggered_offset, max_random_offset,
                               width_gap, length_gap, random_offset_seed, offset_x, offset_y, offset_z,
-                              random_depth, random_depth_seed, tile_name="CustomTileTemplate"):
+                              random_depth, random_depth_seed, tile_name="CustomTileTemplate", tiling_axis='BOTH'):
     all_matrices = []
     tile_obj = bpy.data.objects.get(tile_name)
     if not tile_obj:
         return all_matrices
 
     stretcher_rng = random.Random(random_offset_seed)
-
     t_dim = tile_obj.dimensions
-    # width / length / depth act as SCALE MULTIPLIERS of the custom object's own
-    # size (1.0 = original size, 2.0 = double, 0.5 = half), not absolute sizes.
     new_w = t_dim.x * width
     new_l = t_dim.y * length
-
     u_step = new_w + width_gap
     v_step = new_l + length_gap
+    u_off_step = math.floor(offset_x / u_step)
+    v_off_step = math.floor(offset_y / v_step)
 
     for key, data in groups.items():
         normal, faces = data["normal"], data["faces"]
@@ -441,26 +451,36 @@ def get_custom_tile_matrices(groups, width, length, depth, rot_rad, row_offset, 
             axis_u, axis_v = rot_mat_axes @ axis_u, rot_mat_axes @ axis_v
 
         all_verts = [v for face in faces for v in face]
-        anchor = get_pattern_offset(all_verts[0], axis_u, axis_v, normal, offset_x, offset_y, offset_z)
-
-        projected = [((v - all_verts[0]).dot(axis_u), (v - all_verts[0]).dot(axis_v)) for v in all_verts]
+        anchor_base = all_verts[0]
+        anchor = get_pattern_offset(anchor_base, axis_u, axis_v, normal, offset_x, offset_y, offset_z)
+        projected = [((v - anchor_base).dot(axis_u), (v - anchor_base).dot(axis_v)) for v in all_verts]
         u_min, u_max = min(p[0] for p in projected), max(p[0] for p in projected)
         v_min, v_max = min(p[1] for p in projected), max(p[1] for p in projected)
 
-        for i in range(math.floor((u_min - offset_x) / u_step) - 2, math.ceil((u_max - offset_x) / u_step) + 2):
-            for j in range(math.floor((v_min - offset_y) / v_step) - 2, math.ceil((v_max - offset_y) / v_step) + 2):
+        j_min = math.floor((v_min - offset_y) / v_step) - 1
+        j_max = math.ceil((v_max - offset_y) / v_step) + 1
 
-                random_off = stretcher_rng.uniform(0, max_random_offset)
-                shift = (row_offset if j % 2 != 0 else 0.0) + (j * staggered_offset)
+        for j in range(j_min, j_max):
+            if tiling_axis == 'X' and (j + v_off_step) != 0:
+                continue
+            random_off = stretcher_rng.uniform(0, max_random_offset)
+            
+            # Custom templates use percentual factor multipliers mapped directly to the evaluated width bounds (new_w)
+            shift = (row_offset * new_w if j % 2 != 0 else 0.0) + (j * staggered_offset * new_w) + random_off
+            
+            # Recalculated dynamic internal loops to shrink horizontal footprint limits tightly per row
+            i_min = math.floor((u_min - offset_x - shift - new_w) / u_step)
+            i_max = math.ceil((u_max - offset_x - shift + new_w) / u_step)
 
-                center_pos = anchor + ((i * u_step) + shift + random_off + (new_w * 0.5)) * axis_u + ((j * v_step) + (new_l * 0.5)) * axis_v
+            for i in range(i_min, i_max + 1):
+                if tiling_axis == 'Y' and (i + u_off_step) != 0:
+                    continue
+                center_pos = anchor + ((i * u_step) + shift + (new_w * 0.5)) * axis_u + ((j * v_step) + (new_l * 0.5)) * axis_v
 
                 scale_mat = mathutils.Matrix.Diagonal((width, length, depth, 1.0))
                 rot_mat = mathutils.Matrix((axis_u, axis_v, normal)).transposed().to_4x4()
                 trans = mathutils.Matrix.Translation(center_pos)
-
-                all_matrices.append((trans @ rot_mat @ scale_mat, normal, axis_u, axis_v))
-
+                all_matrices.append((trans @ rot_mat @ scale_mat, normal, axis_u, axis_v, i, j))
     return all_matrices
 
 
@@ -473,34 +493,26 @@ def create_tile_matrix(pos, u_dir, v_dir, normal, l, w, d, z_offset=0.0):
 
 def get_placement_matrices(pattern, groups, width, length, depth, rot_rad, row_offset, staggered_offset, max_random_offset,
                             width_gap, length_gap, offset_x, offset_y, offset_z, random_offset_seed,
-                            random_depth, random_depth_seed, custom_obj_name="CustomTileTemplate"):
+                            random_depth, random_depth_seed, custom_obj_name="CustomTileTemplate", tiling_axis='BOTH'):
     args = (groups, width, length, depth, rot_rad, row_offset, staggered_offset, max_random_offset, width_gap, length_gap, offset_x, offset_y, offset_z)
 
     if pattern == "HERRINGBONE":
-        return get_herringbone_matrices(*args)
+        return get_herringbone_matrices(*args, tiling_axis=tiling_axis)
     if pattern == "CHEVRON":
-        return get_chevron_matrices(*args)
+        return get_chevron_matrices(*args, tiling_axis=tiling_axis)
     if pattern == "WINDMILL":
-        return get_windmill_matrices(*args)
+        return get_windmill_matrices(*args, tiling_axis=tiling_axis)
     if pattern == "CUSTOM":
         return get_custom_tile_matrices(
             groups, width, length, depth, rot_rad, row_offset, staggered_offset, max_random_offset,
             width_gap, length_gap, random_offset_seed, offset_x, offset_y, offset_z,
-            random_depth, random_depth_seed, tile_name=custom_obj_name,
+            random_depth, random_depth_seed, tile_name=custom_obj_name, tiling_axis=tiling_axis
         )
     return get_stretcher_matrices(groups, width, length, depth, rot_rad, row_offset, staggered_offset, max_random_offset,
-                                   width_gap, length_gap, random_offset_seed, offset_x, offset_y, offset_z)
+                                   width_gap, length_gap, random_offset_seed, offset_x, offset_y, offset_z, tiling_axis=tiling_axis)
 
 
 def _build_single_plane_cutter(faces, obj_matrix_world, depth, offset_z, name="_tile_cutter_tmp"):
-    """
-    Builds a solidified cutter object for ONE flat group of faces only.
-    Because every face here shares the same plane, the resulting shell is a
-    single straight prism -- there's no other plane involved, so there's
-    nothing for Solidify to crease against and no other island for it to
-    overlap/self-intersect with. This is what makes the per-group boolean
-    below safe to run with the fast MANIFOLD solver.
-    """
     cutter_bm = bmesh.new()
     vert_map = {}
     for face in faces:
@@ -523,7 +535,7 @@ def _build_single_plane_cutter(faces, obj_matrix_world, depth, offset_z, name="_
     cutter_obj.matrix_world = obj_matrix_world
 
     solidify = cutter_obj.modifiers.new("Solidify", 'SOLIDIFY')
-    solidify.thickness = (depth * 4.0) + abs(offset_z) + 0.05
+    solidify.thickness = (depth * 4.0) + abs(offset_z) + 2.0
     solidify.offset = 0.0
     solidify.use_even_offset = True
 
@@ -537,13 +549,6 @@ def _build_single_plane_cutter(faces, obj_matrix_world, depth, offset_z, name="_
 
 
 def _clip_mesh_to_faces(mesh, faces, obj_matrix_world, depth, offset_z):
-    """
-    Boolean-intersects `mesh` (a single-plane-group's own tile geometry)
-    down to the exact boundary of `faces` (that same group's selected
-    source faces). Runs as its own tiny scene object + its own single-plane
-    cutter, entirely independent of any other group -- nothing here ever
-    sees or interacts with another plane's geometry.
-    """
     tmp_obj = bpy.data.objects.new("_tile_group_tmp", mesh)
     bpy.context.collection.objects.link(tmp_obj)
     tmp_obj.matrix_world = obj_matrix_world
@@ -551,10 +556,6 @@ def _clip_mesh_to_faces(mesh, faces, obj_matrix_world, depth, offset_z):
     cutter_obj = _build_single_plane_cutter(faces, obj_matrix_world, depth, offset_z)
 
     bool_mod = tmp_obj.modifiers.new(name="BooleanClip", type='BOOLEAN')
-    # MANIFOLD is safe here: a single-plane cutter is a simple, clean, non
-    # self-intersecting prism, which is exactly what MANIFOLD is fast and
-    # reliable at. There's no other group's geometry in this operation at
-    # all, so there's nothing left for it to leak through.
     bool_mod.operation, bool_mod.solver, bool_mod.object, bool_mod.use_self = 'INTERSECT', 'MANIFOLD', cutter_obj, False
     bpy.context.view_layer.objects.active = tmp_obj
     bpy.ops.object.modifier_apply(modifier="BooleanClip")
@@ -568,18 +569,12 @@ def _clip_mesh_to_faces(mesh, faces, obj_matrix_world, depth, offset_z):
 def create_tile_batch(face_data, width, length, depth, rotation_angle, row_offset, staggered_offset, max_random_offset,
                        pattern, width_gap, length_gap, offset_x, offset_y, offset_z, uv_random_seed=0,
                        random_offset_seed=0, flip_mode="BOTH", random_depth=0.0, random_depth_seed=0,
-                       custom_obj_name="CustomTileTemplate", obj_matrix_world=None, preserve_uv=False):
+                       custom_obj_name="CustomTileTemplate", obj_matrix_world=None, preserve_uv=False, tiling_axis='BOTH',
+                       use_boolean_clip=True):
     templates = {}
     u_options = [False, True] if flip_mode in ["BOTH", "U"] else [False]
     v_options = [False, True] if flip_mode in ["BOTH", "V"] else [False]
 
-    # CUSTOM tile + "Preserve Source UVs": reuse the custom object's own
-    # authored UV map instead of the generic box-projection below. The
-    # per-tile random mirroring (flip_mode/uv_random_seed) still applies --
-    # it's just done by mirroring the *real* UV coordinates (u' = 1-u /
-    # v' = 1-v) rather than recomputing UVs from local vertex position.
-    # Resolved once here (not per flip-combo) so a missing-UV fallback is
-    # only reported/decided a single time.
     custom_src_obj = bpy.data.objects.get(custom_obj_name) if pattern == "CUSTOM" else None
     src_uv_name = None
     uv_fallback_warning = None
@@ -602,10 +597,7 @@ def create_tile_batch(face_data, width, length, depth, rotation_angle, row_offse
             else:
                 bmesh.ops.create_cube(bm, size=1.0)
 
-            # Explicitly get or create the UV map named "UVMap"
             uv_layer = bm.loops.layers.uv.get("UVMap") or bm.loops.layers.uv.new("UVMap")
-            # Only set (and only looked up per-template-bm, since each is a
-            # fresh bm.from_mesh copy) when preserve_uv resolved a real layer.
             src_uv_layer = bm.loops.layers.uv.get(src_uv_name) if src_uv_name else None
 
             for f in bm.faces:
@@ -635,6 +627,8 @@ def create_tile_batch(face_data, width, length, depth, rotation_angle, row_offse
     master_bm = bmesh.new()
     m_uv = master_bm.loops.layers.uv.get("UVMap") or master_bm.loops.layers.uv.new("UVMap")
     m_tile_normal, m_axis_u, m_axis_v = [master_bm.faces.layers.float_vector.new(n) for n in ["tile_normal", "tile_axis_u", "tile_axis_v"]]
+    m_tile_col = master_bm.faces.layers.float.new("tile_col")
+    m_tile_row = master_bm.faces.layers.float.new("tile_row")
 
     groups = group_faces_by_plane(face_data)
     rot_rad = math.radians(rotation_angle)
@@ -645,14 +639,16 @@ def create_tile_batch(face_data, width, length, depth, rotation_angle, row_offse
         group_matrices = get_placement_matrices(
             pattern, {group_key: group_val}, width, length, depth, rot_rad, row_offset, staggered_offset,
             max_random_offset, width_gap, length_gap, offset_x, offset_y, offset_z,
-            random_offset_seed, random_depth, random_depth_seed, custom_obj_name=custom_obj_name,
+            random_offset_seed, random_depth, random_depth_seed, custom_obj_name=custom_obj_name, tiling_axis=tiling_axis
         )
 
         group_bm = bmesh.new()
         g_uv = group_bm.loops.layers.uv.get("UVMap") or group_bm.loops.layers.uv.new("UVMap")
         g_tile_normal, g_axis_u, g_axis_v = [group_bm.faces.layers.float_vector.new(n) for n in ["tile_normal", "tile_axis_u", "tile_axis_v"]]
+        g_tile_col = group_bm.faces.layers.float.new("tile_col")
+        g_tile_row = group_bm.faces.layers.float.new("tile_row")
 
-        for final_mat, normal, axis_u, axis_v in group_matrices:
+        for final_mat, normal, axis_u, axis_v, tile_col_val, tile_row_val in group_matrices:
             f_u = bool(_fast_tile_bool(uv_random_seed, tile_idx, 1)) if flip_mode in ["BOTH", "U"] else False
             f_v = bool(_fast_tile_bool(uv_random_seed, tile_idx, 2)) if flip_mode in ["BOTH", "V"] else False
             tile_idx += 1
@@ -675,11 +671,8 @@ def create_tile_batch(face_data, width, length, depth, rotation_angle, row_offse
                 for li, loop in enumerate(f_tmp.loops):
                     new_f.loops[li][g_uv].uv = loop[t_uv].uv
                 new_f[g_tile_normal], new_f[g_axis_u], new_f[g_axis_v] = normal, axis_u, axis_v
+                new_f[g_tile_col], new_f[g_tile_row] = float(tile_col_val), float(tile_row_val)
 
-        # Mark every face of this pristine (un-clipped) tile mesh so that,
-        # after the boolean clip below, set_tile_edge_attributes() can tell
-        # genuine tile edges apart from the new boundary edges the clip-cutter
-        # introduces (those new faces never get this marker).
         g_orig_face = group_bm.faces.layers.float.new("_orig_tile_face")
         for f in group_bm.faces:
             f[g_orig_face] = 1.0
@@ -688,10 +681,13 @@ def create_tile_batch(face_data, width, length, depth, rotation_angle, row_offse
         group_bm.to_mesh(group_mesh)
         group_bm.free()
 
-        clipped_mesh = _clip_mesh_to_faces(group_mesh, group_val["faces"], obj_matrix_world, depth, offset_z)
-
-        master_bm.from_mesh(clipped_mesh)
-        bpy.data.meshes.remove(clipped_mesh)
+        if use_boolean_clip:
+            clipped_mesh = _clip_mesh_to_faces(group_mesh, group_val["faces"], obj_matrix_world, depth, offset_z)
+            master_bm.from_mesh(clipped_mesh)
+            bpy.data.meshes.remove(clipped_mesh)
+        else:
+            master_bm.from_mesh(group_mesh)
+            bpy.data.meshes.remove(group_mesh)
 
     for bm in templates.values():
         bm.free()
@@ -701,15 +697,66 @@ def create_tile_batch(face_data, width, length, depth, rotation_angle, row_offse
     return me_batch, uv_fallback_warning
 
 
+def _tile_matches_pattern(col, row, mode, step_x, offset_x, step_y, offset_y, invert):
+    """
+    Shared match test for 'is this real tile (identified by its col/row grid
+    index) picked by this pattern'. Used both by the interactive Select
+    Tiles by Pattern operator and by the persisted material rules, so the
+    two always agree on what a given pattern selects.
+    """
+    if mode == 'CHECKER':
+        block_col = math.floor((col - offset_x) / step_x)
+        block_row = math.floor((row - offset_y) / step_y)
+        parity = (block_col + block_row) % 2
+        return (parity == 1) if invert else (parity == 0)
+    return ((col - offset_x) % step_x == 0) and ((row - offset_y) % step_y == 0)
+
+
+def _apply_material_rules(batch_obj):
+    """
+    Re-applies the persisted pattern -> material rules (settings.material_rules)
+    onto the batch mesh. Called automatically after every regeneration so a
+    material assigned via a pattern survives live-updates instead of being
+    lost when the mesh is rebuilt from scratch (regeneration replaces
+    batch_obj.data entirely, so any one-off manual face.material_index
+    edit can't survive it -- only a remembered rule can).
+    """
+    settings = batch_obj.smart_tile_props
+    rules = [r for r in settings.material_rules if r.material is not None]
+    if not rules:
+        return
+
+    mesh = batch_obj.data
+    rule_slots = []
+    for rule in rules:
+        if rule.material.name not in mesh.materials:
+            mesh.materials.append(rule.material)
+        rule_slots.append(mesh.materials.find(rule.material.name))
+
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    l_col = bm.faces.layers.float.get("tile_col")
+    l_row = bm.faces.layers.float.get("tile_row")
+    if l_col is None or l_row is None:
+        bm.free()
+        return
+
+    for f in bm.faces:
+        col = round(f[l_col])
+        row = round(f[l_row])
+        for rule, slot in zip(rules, rule_slots):
+            if _tile_matches_pattern(col, row, rule.mode, rule.step_x, rule.offset_x, rule.step_y, rule.offset_y, rule.invert):
+                f.material_index = slot
+
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.update()
+
+
 def _finalize_batch_mesh(batch_obj, depth):
-    """
-    Fix normals and (re)write the edge-attribute layers on a generated 
-    batch object using the attribute names defined in the object's settings.
-    """
     bm_final = bmesh.new()
     bm_final.from_mesh(batch_obj.data)
     
-    # 1. Fix Normals
     l_normal = bm_final.faces.layers.float_vector.get("tile_normal")
     if l_normal:
         for f in bm_final.faces:
@@ -717,7 +764,6 @@ def _finalize_batch_mesh(batch_obj, depth):
                 f.normal_flip()
     bmesh.ops.recalc_face_normals(bm_final, faces=bm_final.faces[:])
     
-    # 2. Collect dynamic attribute names from settings
     settings = batch_obj.smart_tile_props
     attr_names = {
         "top": settings.attr_bevel_top,
@@ -728,17 +774,15 @@ def _finalize_batch_mesh(batch_obj, depth):
         "boolean": settings.attr_boolean_edge,
     }
     
-    # 3. Apply edge attributes using the collected names
     set_tile_edge_attributes(bm_final, depth, attr_names)
     
-    # 4. Finalize
     bm_final.to_mesh(batch_obj.data)
     bm_final.free()
     batch_obj.data.update()
 
 
 # ---------------------------------------------------------------------------
-# PER-OBJECT SETTINGS (this is what gives the addon its "memory")
+# PER-OBJECT SETTINGS
 # ---------------------------------------------------------------------------
 
 PATTERN_ITEMS = [
@@ -756,18 +800,20 @@ FLIP_ITEMS = [
     ('NONE', "None", "No random flipping"),
 ]
 
-# ---------------------------------------------------------------------------
-# PER-OBJECT SETTINGS
-# ---------------------------------------------------------------------------
+TILING_AXIS_ITEMS = [
+    ('BOTH', "Both Axes", "Tile along both X and Y axes"),
+    ('X', "X Axis Only", "Tile only along the X axis"),
+    ('Y', "Y Axis Only", "Tile only along the Y axis"),
+]
+
 
 def _copy_settings(src, dst):
-    """Helper to copy settings from one property group to another."""
     global _suspend_realtime_update
     prev = _suspend_realtime_update
     _suspend_realtime_update = True
     try:
         for key in src.__annotations__.keys():
-            if key in ("is_tile_batch", "source_object", "face_indices", "face_snapshot"):
+            if key in ("is_tile_batch", "source_object", "face_indices", "face_snapshot", "material_rules", "material_rules_index"):
                 continue
             setattr(dst, key, getattr(src, key))
     finally:
@@ -775,18 +821,6 @@ def _copy_settings(src, dst):
 
 
 def _run_deferred_tile_update(obj_name):
-    """
-    Runs on the next event-loop tick (via bpy.app.timers), NOT inside the
-    property update callback that scheduled it. This matters: the per-group
-    clip in create_tile_batch creates+deletes a temp object and applies a
-    boolean modifier once per plane-group, and doing that repeatedly from
-    directly inside an RNA property `update` callback is a known-fragile
-    combination in Blender (that callback runs in a restricted context
-    without guaranteed full window/depsgraph state) -- it can silently apply
-    incorrectly or skip a group, leaving that group's tiles unclipped/
-    oversized. Running it here instead gives it a normal, unrestricted
-    execution context every time.
-    """
     global _suspend_realtime_update
     try:
         obj = bpy.data.objects.get(obj_name)
@@ -794,13 +828,10 @@ def _run_deferred_tile_update(obj_name):
             _perform_tile_update(bpy.context, obj)
     finally:
         _suspend_realtime_update = False
-    return None  # one-shot timer, don't reschedule
+    return None
 
 
 def _trigger_realtime_update(self, context):
-    """Property `update` callback: schedule a regeneration (deferred, see
-    _run_deferred_tile_update) if this property group belongs to an
-    already-generated batch object."""
     global _suspend_realtime_update
     if _suspend_realtime_update:
         return
@@ -811,17 +842,52 @@ def _trigger_realtime_update(self, context):
     if not self.is_tile_batch or self.source_object is None:
         return
 
-    # Set the guard immediately so rapid-fire property changes (e.g.
-    # dragging a slider) don't queue up multiple overlapping regenerations
-    # before the first deferred one has even run. _run_deferred_tile_update
-    # clears it once that regeneration completes, and will pick up whatever
-    # the property values are AT THAT TIME, so the final value always wins.
     _suspend_realtime_update = True
     bpy.app.timers.register(lambda name=obj.name: _run_deferred_tile_update(name), first_interval=0.0)
 
 
+def _run_deferred_material_rule_update(obj_name):
+    global _suspend_material_rule_update
+    try:
+        obj = bpy.data.objects.get(obj_name)
+        if obj is not None and obj.smart_tile_props.is_tile_batch:
+            was_edit = (obj.mode == 'EDIT')
+            if was_edit:
+                bpy.context.view_layer.objects.active = obj
+                bpy.ops.object.mode_set(mode='OBJECT')
+            _apply_material_rules(obj)
+            if was_edit:
+                bpy.ops.object.mode_set(mode='EDIT')
+            wm = bpy.context.window_manager
+            if wm:
+                for window in wm.windows:
+                    for area in window.screen.areas:
+                        area.tag_redraw()
+    finally:
+        _suspend_material_rule_update = False
+    return None
+
+
+def _trigger_material_rule_update(self, context):
+    """Update callback for SmartTileMaterialRule fields: re-applies all
+    material rules a moment after any rule is edited, so changing a rule's
+    pattern or material shows up in real time instead of requiring a manual
+    Apply Material Rules click."""
+    global _suspend_material_rule_update
+    if _suspend_material_rule_update:
+        return
+
+    obj = self.id_data
+    if not isinstance(obj, bpy.types.Object):
+        return
+    if not obj.smart_tile_props.is_tile_batch:
+        return
+
+    _suspend_material_rule_update = True
+    bpy.app.timers.register(lambda name=obj.name: _run_deferred_material_rule_update(name), first_interval=0.0)
+
+
 def update_pattern_defaults(self, context):
-    """Callback to set default values when the pattern is changed."""
     global _suspend_realtime_update
     prev = _suspend_realtime_update
     _suspend_realtime_update = True
@@ -846,13 +912,14 @@ def update_pattern_defaults(self, context):
         self.offset_x = 0.0
         self.offset_y = 0.0
         self.offset_z = 0.0
+        self.tiling_axis = 'BOTH'
 
     elif pattern == 'STRETCHER':
         self.width = 2.0
         self.length = 0.2
         self.depth = 0.2
         self.rotation_angle = 0.0
-        self.row_offset = 0.0
+        self.row_offset = 0.5  # Formats out of the box into a perfect standard 50% half-brick lap
         self.staggered_offset = 0.0
         self.max_random_offset = 0.0
         self.random_offset_seed = 5
@@ -865,6 +932,7 @@ def update_pattern_defaults(self, context):
         self.offset_x = 0.0
         self.offset_y = 0.0
         self.offset_z = 0.0
+        self.tiling_axis = 'BOTH'
 
     elif pattern == 'HERRINGBONE':
         self.width = 0.25
@@ -884,6 +952,7 @@ def update_pattern_defaults(self, context):
         self.offset_x = 0.0
         self.offset_y = 0.0
         self.offset_z = 0.0
+        self.tiling_axis = 'BOTH'
 
     elif pattern == 'CHEVRON':
         self.width = 0.2
@@ -903,6 +972,7 @@ def update_pattern_defaults(self, context):
         self.offset_x = 0.0
         self.offset_y = 0.0
         self.offset_z = 0.0
+        self.tiling_axis = 'BOTH'
 
     elif pattern == 'WINDMILL':
         self.width = 0.2
@@ -922,24 +992,47 @@ def update_pattern_defaults(self, context):
         self.offset_x = 0.0
         self.offset_y = 0.0
         self.offset_z = 0.0
+        self.tiling_axis = 'BOTH'
 
     _suspend_realtime_update = prev
     _trigger_realtime_update(self, context)
+
+
+class SmartTileMaterialRule(PropertyGroup):
+    """One persisted 'tiles matching this pattern get this material' rule.
+    A list of these lives on SmartTileSettings.material_rules and is
+    automatically re-applied after every regeneration (see
+    _apply_material_rules), so pattern-based material assignments survive
+    live property edits instead of being lost when the mesh is rebuilt."""
+    mode: EnumProperty(
+        items=[
+            ('CHECKER', "Checkerboard", "Alternating blocks of tiles"),
+            ('STEP', "Step (X/Y)", "Every Nth tile along X and Y, independently"),
+        ],
+        name="Mode",
+        default='CHECKER',
+        update=_trigger_material_rule_update,
+    )
+    invert: BoolProperty(name="Invert", default=False, update=_trigger_material_rule_update)
+    step_x: IntProperty(name="Step X", default=1, min=1, update=_trigger_material_rule_update)
+    offset_x: IntProperty(name="Offset X", default=0, update=_trigger_material_rule_update)
+    step_y: IntProperty(name="Step Y", default=1, min=1, update=_trigger_material_rule_update)
+    offset_y: IntProperty(name="Offset Y", default=0, update=_trigger_material_rule_update)
+    material: PointerProperty(type=bpy.types.Material, name="Material", update=_trigger_material_rule_update)
 
 
 class SmartTileSettings(PropertyGroup):
     is_tile_batch: BoolProperty(default=False)
     source_object: PointerProperty(type=bpy.types.Object)
     face_indices: StringProperty(default="")
-    # JSON snapshot of the exact (normal, verts) face_data captured at
-    # Generate time -- see encode_face_data_snapshot / decode_face_data_snapshot.
-    # This is the authoritative source for updates: re-deriving face_data
-    # from the live mesh on every update (via face_indices + a fresh bmesh)
-    # was what made grouping/normals fragile, since a freshly-built bmesh
-    # isn't guaranteed to match the live edit-mode bmesh used at Generate
-    # time bit-for-bit. Storing the real snapshot once removes that
-    # dependency entirely -- every update reuses precisely what Generate saw.
     face_snapshot: StringProperty(default="")
+
+    use_boolean_clip: BoolProperty(
+        name="Enable Boolean Clip",
+        description="Clip generated tiles to face borders. Disable for faster performance",
+        default=True,
+        update=_trigger_realtime_update
+    )
 
     pattern: EnumProperty(
         items=PATTERN_ITEMS, 
@@ -947,13 +1040,45 @@ class SmartTileSettings(PropertyGroup):
         default='STRETCHER',
         update=update_pattern_defaults
     )
+    tiling_axis: EnumProperty(
+        items=TILING_AXIS_ITEMS,
+        name="Tiling Axis",
+        default='BOTH',
+        update=_trigger_realtime_update
+    )
     width: FloatProperty(name="Width", default=2.0, min=0.0001, unit='LENGTH', update=_trigger_realtime_update)
     length: FloatProperty(name="Length", default=0.2, min=0.0001, unit='LENGTH', update=_trigger_realtime_update)
     depth: FloatProperty(name="Depth", default=0.2, min=0.0001, unit='LENGTH', update=_trigger_realtime_update)
     rotation_angle: FloatProperty(name="Rotation", default=0.0, subtype='ANGLE', update=_trigger_realtime_update)
-    row_offset: FloatProperty(name="Row Offset", default=0.0, unit='LENGTH', update=_trigger_realtime_update)
-    staggered_offset: FloatProperty(name="Staggered Offset", default=0.0, unit='LENGTH', update=_trigger_realtime_update)
-    max_random_offset: FloatProperty(name="Max Random Offset", default=1.0, min=0.0, unit='LENGTH', update=_trigger_realtime_update)
+    
+    row_offset: FloatProperty(
+        name="Row Offset",
+        default=0.0,
+        min=-1.0,
+        max=1.0,
+        soft_min=-1.0,
+        soft_max=1.0,
+        update=_trigger_realtime_update,
+    )
+    staggered_offset: FloatProperty(
+        name="Staggered Offset", 
+        default=0.0,
+        min=-1.0,
+        max=1.0,
+        soft_min=-1.0,
+        soft_max=1.0,
+        description="Progressively shift subsequent rows as a fraction of the tile width",
+        update=_trigger_realtime_update
+    )
+    
+    max_random_offset: FloatProperty(
+        name="Max Random Offset", 
+        default=0.0, 
+        min=-10.0,
+        max=10.0,
+        subtype='FACTOR',
+        update=_trigger_realtime_update
+    )
     width_gap: FloatProperty(name="Width Gap", default=0.0, unit='LENGTH', update=_trigger_realtime_update)
     length_gap: FloatProperty(name="Length Gap", default=0.0, unit='LENGTH', update=_trigger_realtime_update)
     uv_random_seed: IntProperty(name="UV Seed", default=235, update=_trigger_realtime_update)
@@ -993,6 +1118,28 @@ class SmartTileSettings(PropertyGroup):
         ),
     )
 
+    select_mode: EnumProperty(
+        items=[
+            ('CHECKER', "Checkerboard", "Select alternating blocks of tiles (block size/shift set by Step/Offset below)"),
+            ('STEP', "Step (X/Y)", "Select every Nth tile along X and every Nth tile along Y, independently"),
+        ],
+        name="Select Mode",
+        default='CHECKER',
+        description="How tiles are picked when using Select Tiles by Pattern",
+    )
+    select_checker_invert: BoolProperty(
+        name="Invert",
+        default=False,
+        description="Select the other half of the checkerboard",
+    )
+    select_step_x: IntProperty(name="Step X", default=1, min=1, description="Step mode: select every Nth column. Checker mode: checker block width in tiles")
+    select_offset_x: IntProperty(name="Offset X", default=0, description="Shifts the pattern along X (columns)")
+    select_step_y: IntProperty(name="Step Y", default=1, min=1, description="Step mode: select every Nth row. Checker mode: checker block height in tiles")
+    select_offset_y: IntProperty(name="Offset Y", default=0, description="Shifts the pattern along Y (rows)")
+
+    material_rules: CollectionProperty(type=SmartTileMaterialRule)
+    material_rules_index: IntProperty(default=0)
+
 # ---------------------------------------------------------------------------
 # OPERATORS
 # ---------------------------------------------------------------------------
@@ -1009,19 +1156,15 @@ class SMARTTILE_OT_generate(Operator):
         return obj is not None and obj.type == 'MESH' and obj.mode == 'EDIT'
     
     def execute(self, context):
-        # 1. Identify all valid, selected mesh objects
         selected_meshes = [obj for obj in context.selected_objects if obj.type == 'MESH']
 
         if not selected_meshes:
             self.report({'WARNING'}, "No mesh objects selected")
             return {'CANCELLED'}
 
-        # Track generated batches to select them at the end
         generated_batches = []
 
-        # 2. Iterate through each selected object
         for obj in selected_meshes:
-            # Ensure the object is in EDIT mode to get face data
             if obj.mode != 'EDIT':
                 context.view_layer.objects.active = obj
                 bpy.ops.object.mode_set(mode='EDIT')
@@ -1040,7 +1183,6 @@ class SMARTTILE_OT_generate(Operator):
             face_indices = [f.index for f in sel_faces]
             face_data = [(f.normal.copy(), [v.co.copy() for v in f.verts]) for f in sel_faces]
 
-            # Move to object mode to generate the batch
             bpy.ops.object.mode_set(mode='OBJECT')
 
             custom_name = settings.custom_tile_object.name if settings.custom_tile_object else ""
@@ -1053,6 +1195,8 @@ class SMARTTILE_OT_generate(Operator):
                 flip_mode=settings.flip_mode, random_depth=settings.random_depth, 
                 random_depth_seed=settings.random_depth_seed, custom_obj_name=custom_name, 
                 obj_matrix_world=obj.matrix_world, preserve_uv=settings.preserve_custom_uv,
+                tiling_axis=settings.tiling_axis,
+                use_boolean_clip=settings.use_boolean_clip
             )
             if uv_warning:
                 self.report({'WARNING'}, uv_warning)
@@ -1063,7 +1207,6 @@ class SMARTTILE_OT_generate(Operator):
 
             _finalize_batch_mesh(batch_obj, settings.depth)
 
-            # Store the settings and metadata
             batch_obj.smart_tile_props.is_tile_batch = True
             batch_obj.smart_tile_props.source_object = obj
             batch_obj.smart_tile_props.face_indices = ",".join(str(i) for i in face_indices)
@@ -1072,7 +1215,6 @@ class SMARTTILE_OT_generate(Operator):
             
             generated_batches.append(batch_obj)
 
-        # 3. Final Selection Handling: Deselect all, select batches, make the last one active
         bpy.ops.object.select_all(action='DESELECT')
         for batch in generated_batches:
             batch.select_set(True)
@@ -1092,25 +1234,22 @@ def _perform_tile_update(context, batch_obj):
     if src_obj is None or src_obj.name not in bpy.data.objects:
         return False, "Source object no longer exists"
 
-    # 1. PRESERVE EXISTING STATE
-    # create_tile_batch below creates + deletes a temp object per plane-group
-    # and repeatedly reassigns view_layer.objects.active while clipping each
-    # one. Nothing else resets it afterwards on this path (unlike the
-    # Generate operator, which explicitly restores selection at the end), so
-    # capture it now and restore it before returning.
     prev_active = context.view_layer.objects.active
     prev_selected_names = {o.name for o in context.view_layer.objects if o.select_get()}
+
+    was_edit_mode = (batch_obj.mode == 'EDIT')
+    if was_edit_mode:
+        context.view_layer.objects.active = batch_obj
+        bpy.ops.object.mode_set(mode='OBJECT')
 
     old_mesh = batch_obj.data
     old_materials = list(old_mesh.materials)
 
-    # Capture all modifiers
     modifier_data = []
     for mod in batch_obj.modifiers:
         if mod.name == "BooleanClip":
             continue
 
-        # Capture properties via RNA
         mod_props = {}
         for prop in mod.bl_rna.properties:
             if not prop.is_readonly and not prop.is_skip_save:
@@ -1120,13 +1259,6 @@ def _perform_tile_update(context, batch_obj):
                     continue
         modifier_data.append((mod.name, mod.type, mod_props))
 
-    # 2. GENERATE NEW MESH
-    # Prefer the exact snapshot captured at Generate time -- this is what
-    # actually fixes the update-only grouping/normal glitches, since it means
-    # update never has to re-derive face_data from the live mesh at all, and
-    # therefore can't disagree with what Generate originally saw. Only fall
-    # back to re-deriving from the mesh (via the stored face indices) for
-    # objects generated before this snapshot existed.
     face_data = decode_face_data_snapshot(settings.face_snapshot)
     if face_data is None:
         try:
@@ -1146,7 +1278,6 @@ def _perform_tile_update(context, batch_obj):
 
         face_data = [(f.normal.copy(), [v.co.copy() for v in f.verts]) for f in sel_faces]
         bm_src.free()
-        # Backfill the snapshot so subsequent updates use it directly.
         settings.face_snapshot = encode_face_data_snapshot(face_data)
 
     custom_name = settings.custom_tile_object.name if settings.custom_tile_object else ""
@@ -1163,22 +1294,20 @@ def _perform_tile_update(context, batch_obj):
         custom_obj_name=custom_name,
         obj_matrix_world=src_obj.matrix_world,
         preserve_uv=settings.preserve_custom_uv,
+        tiling_axis=settings.tiling_axis,
+        use_boolean_clip=settings.use_boolean_clip
     )
 
-    # 3. SWAP DATA
-    # Clear modifiers only after copying their state
     batch_obj.modifiers.clear()
     batch_obj.data = me_batch
     bpy.data.meshes.remove(old_mesh)
 
-    # 4. RESTORE MATERIALS
     for mat in old_materials:
         me_batch.materials.append(mat)
 
-    # 5. RE-APPLY LOGIC AND RESTORE MODIFIERS
     _finalize_batch_mesh(batch_obj, settings.depth)
+    _apply_material_rules(batch_obj)
 
-    # Re-apply modifiers in original order
     for name, m_type, props in modifier_data:
         new_mod = batch_obj.modifiers.new(name=name, type=m_type)
         for key, val in props.items():
@@ -1187,16 +1316,17 @@ def _perform_tile_update(context, batch_obj):
             except (AttributeError, TypeError, ValueError):
                 continue
 
-    # Restore selection/active state to what it was before this update --
-    # undoes any lingering effect of the per-group temp objects used during
-    # clipping.
     for o in context.view_layer.objects:
         o.select_set(o.name in prev_selected_names)
     if prev_active is not None and prev_active.name in bpy.data.objects:
         context.view_layer.objects.active = prev_active
 
-    # On success `message` doubles as a non-fatal warning slot (e.g. the
-    # Preserve Source UVs fallback notice) rather than an error string.
+    if was_edit_mode and batch_obj.name in bpy.data.objects:
+        context.view_layer.objects.active = batch_obj
+        bpy.ops.object.mode_set(mode='EDIT')
+        if prev_active is not None and prev_active.name in bpy.data.objects:
+            context.view_layer.objects.active = prev_active
+
     return True, (uv_warning or "")
 
 
@@ -1246,12 +1376,13 @@ class MESH_OT_sync_tile_settings(Operator):
         src_props = source_obj.smart_tile_props
         
         props_to_sync = [
-            "pattern", "width", "length", "depth", "rotation_angle",
+            "pattern", "tiling_axis", "width", "length", "depth", "rotation_angle",
             "row_offset", "staggered_offset", "max_random_offset", "random_offset_seed",
             "width_gap", "length_gap", "uv_random_seed", "flip_mode",
             "random_depth", "random_depth_seed", "offset_x", "offset_y", "offset_z",
             "attr_bevel_top", "attr_bevel_bottom", "attr_bevel_side", 
-            "attr_width_edge", "attr_length_edge", "attr_boolean_edge"
+            "attr_width_edge", "attr_length_edge", "attr_boolean_edge",
+            "use_boolean_clip"
         ]
         if hasattr(src_props, "custom_tile_object"):
             props_to_sync.append("custom_tile_object")
@@ -1265,7 +1396,6 @@ class MESH_OT_sync_tile_settings(Operator):
             self.report({'WARNING'}, "No other valid tile batches selected")
             return {'CANCELLED'}
 
-        # Suspend updates globally so we don't trigger partial refreshes during the loop
         _suspend_realtime_update = True
         try:
             for obj in targets:
@@ -1273,15 +1403,161 @@ class MESH_OT_sync_tile_settings(Operator):
                 for prop in props_to_sync:
                     setattr(target_props, prop, getattr(src_props, prop))
                 
-                # Explicitly force the update now that all properties are set
-                # We assume you have a function that triggers the actual rebuild
                 _perform_tile_update(context, obj)
         finally:
             _suspend_realtime_update = False
-            # Force a single view layer update to refresh the scene state
             context.view_layer.update()
         
         self.report({'INFO'}, f"Synced settings to {len(targets)} tiles.")
+        return {'FINISHED'}
+
+
+class SMARTTILE_OT_select_tiles_by_pattern(Operator):
+    """Select whole real tiles (not individual faces) on a generated tile batch, by an X/Y pattern"""
+    bl_idname = "mesh.smart_tile_select_by_pattern"
+    bl_label = "Select Tiles by Pattern"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (
+            obj is not None
+            and obj.type == 'MESH'
+            and hasattr(obj, "smart_tile_props")
+            and obj.smart_tile_props.is_tile_batch
+        )
+
+    def execute(self, context):
+        obj = context.active_object
+        settings = obj.smart_tile_props
+
+        prev_mode = obj.mode
+        if prev_mode != 'EDIT':
+            bpy.ops.object.mode_set(mode='EDIT')
+
+        bm = bmesh.from_edit_mesh(obj.data)
+        l_col = bm.faces.layers.float.get("tile_col")
+        l_row = bm.faces.layers.float.get("tile_row")
+
+        if l_col is None or l_row is None:
+            if prev_mode != 'EDIT':
+                bpy.ops.object.mode_set(mode=prev_mode)
+            self.report({'ERROR'}, "No tile position data on this mesh -- use Force Refresh to regenerate it first")
+            return {'CANCELLED'}
+
+        step_x, offset_x = settings.select_step_x, settings.select_offset_x
+        step_y, offset_y = settings.select_step_y, settings.select_offset_y
+        checker_invert = settings.select_checker_invert
+
+        for f in bm.faces:
+            col = round(f[l_col])
+            row = round(f[l_row])
+            match = _tile_matches_pattern(col, row, settings.select_mode, step_x, offset_x, step_y, offset_y, checker_invert)
+            f.select = match
+
+        bm.select_flush(True)
+        bmesh.update_edit_mesh(obj.data)
+
+        if prev_mode != 'EDIT':
+            bpy.ops.object.mode_set(mode=prev_mode)
+
+        return {'FINISHED'}
+
+
+class SMARTTILE_UL_material_rules(UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        row = layout.row(align=True)
+        row.prop(item, "mode", text="")
+        row.prop(item, "material", text="")
+
+
+class SMARTTILE_OT_add_material_rule(Operator):
+    """Add a persistent pattern->material rule, using the current pattern settings above and the object's active material"""
+    bl_idname = "object.smart_tile_add_material_rule"
+    bl_label = "Add Material Rule"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj is not None and hasattr(obj, "smart_tile_props") and obj.smart_tile_props.is_tile_batch
+
+    def execute(self, context):
+        global _suspend_material_rule_update
+        obj = context.active_object
+        settings = obj.smart_tile_props
+
+        _suspend_material_rule_update = True
+        try:
+            rule = settings.material_rules.add()
+            rule.mode = settings.select_mode
+            rule.step_x = settings.select_step_x
+            rule.offset_x = settings.select_offset_x
+            rule.step_y = settings.select_step_y
+            rule.offset_y = settings.select_offset_y
+            rule.invert = settings.select_checker_invert
+            rule.material = obj.active_material
+            settings.material_rules_index = len(settings.material_rules) - 1
+        finally:
+            _suspend_material_rule_update = False
+
+        was_edit = (obj.mode == 'EDIT')
+        if was_edit:
+            bpy.ops.object.mode_set(mode='OBJECT')
+        _apply_material_rules(obj)
+        if was_edit:
+            bpy.ops.object.mode_set(mode='EDIT')
+        return {'FINISHED'}
+
+
+class SMARTTILE_OT_remove_material_rule(Operator):
+    """Remove the selected material rule"""
+    bl_idname = "object.smart_tile_remove_material_rule"
+    bl_label = "Remove Material Rule"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (
+            obj is not None
+            and hasattr(obj, "smart_tile_props")
+            and obj.smart_tile_props.is_tile_batch
+            and len(obj.smart_tile_props.material_rules) > 0
+        )
+
+    def execute(self, context):
+        settings = context.active_object.smart_tile_props
+        settings.material_rules.remove(settings.material_rules_index)
+        settings.material_rules_index = max(0, settings.material_rules_index - 1)
+        return {'FINISHED'}
+
+
+class SMARTTILE_OT_apply_material_rules(Operator):
+    """Re-apply all persisted pattern->material rules onto this tile batch now"""
+    bl_idname = "object.smart_tile_apply_material_rules"
+    bl_label = "Apply Material Rules"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (
+            obj is not None
+            and obj.type == 'MESH'
+            and hasattr(obj, "smart_tile_props")
+            and obj.smart_tile_props.is_tile_batch
+        )
+
+    def execute(self, context):
+        obj = context.active_object
+        was_edit = (obj.mode == 'EDIT')
+        if was_edit:
+            bpy.ops.object.mode_set(mode='OBJECT')
+        _apply_material_rules(obj)
+        if was_edit:
+            bpy.ops.object.mode_set(mode='EDIT')
         return {'FINISHED'}
 
 # ---------------------------------------------------------------------------
@@ -1306,7 +1582,6 @@ class SMARTTILE_PT_panel(Panel):
         is_result = settings.is_tile_batch
 
         if is_result:
-            # Only define and use these variables if it's a batch result
             src_obj = settings.source_object
             src_name = src_obj.name if src_obj else "(missing)"
             
@@ -1317,6 +1592,8 @@ class SMARTTILE_PT_panel(Panel):
             layout.label(text="Select faces in Edit Mode, then Generate", icon='INFO')
 
         layout.prop(settings, "pattern")
+        layout.prop(settings, "tiling_axis")
+        layout.prop(settings, "use_boolean_clip", text="Boolean Clip (Performance)")
 
         if settings.pattern == 'CUSTOM':
             layout.prop(settings, "custom_tile_object")
@@ -1333,18 +1610,13 @@ class SMARTTILE_PT_panel(Panel):
 
         layout.prop(settings, "rotation_angle")
 
-        if settings.pattern == 'STRETCHER':
+        if settings.pattern in ('STRETCHER', 'CUSTOM'):
             col = layout.column(align=True)
-            col.prop(settings, "row_offset")
-            col.prop(settings, "staggered_offset")
+            col.prop(settings, "row_offset", slider=True)
+#            col.prop(settings, "row_offset")
+            col.prop(settings, "staggered_offset", slider=True)
             col.prop(settings, "max_random_offset")
             col.prop(settings, "random_offset_seed")
-
-        if settings.pattern == 'CUSTOM':
-            layout.prop(settings, "max_random_offset")
-            layout.prop(settings, "row_offset")
-            layout.prop(settings, "staggered_offset")
-            layout.prop(settings, "random_offset_seed")
 
         col = layout.column(align=True)
         col.prop(settings, "width_gap")
@@ -1363,7 +1635,6 @@ class SMARTTILE_PT_panel(Panel):
         col.prop(settings, "offset_y")
         col.prop(settings, "offset_z")
 
-        # Attribute Name Sub-panel
         box = layout.box()
         box.label(text="Edge Attribute Names:", icon='FILE_TEXT')
         box.prop(settings, "attr_bevel_top")
@@ -1373,6 +1644,44 @@ class SMARTTILE_PT_panel(Panel):
         box.prop(settings, "attr_length_edge")
         box.prop(settings, "attr_boolean_edge")
         
+        if is_result:
+            box = layout.box()
+            box.label(text="Select Tiles by Pattern:", icon='SELECT_SET')
+            box.prop(settings, "select_mode")
+            row = box.row(align=True)
+            row.prop(settings, "select_step_x")
+            row.prop(settings, "select_offset_x")
+            row = box.row(align=True)
+            row.prop(settings, "select_step_y")
+            row.prop(settings, "select_offset_y")
+            if settings.select_mode == 'CHECKER':
+                box.prop(settings, "select_checker_invert")
+            box.operator("mesh.smart_tile_select_by_pattern", icon='SELECT_SET')
+
+            box = layout.box()
+            box.label(text="Pattern -> Material Rules (persists on regen):", icon='MATERIAL')
+            row = box.row()
+            row.template_list(
+                "SMARTTILE_UL_material_rules", "", settings, "material_rules",
+                settings, "material_rules_index", rows=3
+            )
+            col = row.column(align=True)
+            col.operator("object.smart_tile_add_material_rule", text="", icon='ADD')
+            col.operator("object.smart_tile_remove_material_rule", text="", icon='REMOVE')
+            if settings.material_rules:
+                idx = min(settings.material_rules_index, len(settings.material_rules) - 1)
+                active_rule = settings.material_rules[idx]
+                sub = box.column(align=True)
+                r = sub.row(align=True)
+                r.prop(active_rule, "step_x")
+                r.prop(active_rule, "offset_x")
+                r = sub.row(align=True)
+                r.prop(active_rule, "step_y")
+                r.prop(active_rule, "offset_y")
+                if active_rule.mode == 'CHECKER':
+                    sub.prop(active_rule, "invert")
+            box.operator("object.smart_tile_apply_material_rules", icon='FILE_REFRESH')
+
         layout.separator()
         layout.operator("mesh.sync_tile_settings", icon='COPY_ID')
 
@@ -1385,10 +1694,16 @@ class SMARTTILE_PT_panel(Panel):
 
 
 classes = (
+    SmartTileMaterialRule,
     SmartTileSettings,
     MESH_OT_sync_tile_settings,
     SMARTTILE_OT_generate,
     SMARTTILE_OT_update,
+    SMARTTILE_OT_select_tiles_by_pattern,
+    SMARTTILE_UL_material_rules,
+    SMARTTILE_OT_add_material_rule,
+    SMARTTILE_OT_remove_material_rule,
+    SMARTTILE_OT_apply_material_rules,
     SMARTTILE_PT_panel,
 )
 
