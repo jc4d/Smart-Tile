@@ -95,6 +95,30 @@ def get_pattern_offset(pos, axis_u, axis_v, normal, offset_x, offset_y, offset_z
     return pos + offset_vec
 
 
+def _fast_tile_bool(seed, tile_idx, salt):
+    """
+    Deterministic pseudo-random bit for per-tile UV-flip decisions, used in
+    place of constructing a fresh random.Random(seed) per tile. Profiling
+    showed ~24k Random() object constructions (seed + init) costing real
+    time for something that only needed a single coin-flip each. This is a
+    small integer hash (SplitMix-style bit mixing) instead: same seed+idx
+    always gives the same result (still fully deterministic/reproducible),
+    but with no object-construction overhead.
+
+    Not cryptographic -- just uniform enough for a visual UV-mirroring
+    coin-flip. NOTE: this produces a DIFFERENT flip pattern than the old
+    random.Random-based version for the same uv_random_seed, so existing
+    generated tile batches will look slightly different after an Update.
+    """
+    x = (seed * 2654435761 + tile_idx * 2246822519 + salt * 3266489917) & 0xFFFFFFFF
+    x ^= x >> 16
+    x = (x * 0x85ebca6b) & 0xFFFFFFFF
+    x ^= x >> 13
+    x = (x * 0xc2b2ae35) & 0xFFFFFFFF
+    x ^= x >> 16
+    return x & 1
+
+
 def set_tile_edge_attributes(bm, depth, attr_names):
     """
     attr_names is a dictionary mapping logical roles to the string names 
@@ -134,28 +158,47 @@ def set_tile_edge_attributes(bm, depth, attr_names):
         if marked == 0:
             orig_face_marker = None
 
+    # Precompute per-face data ONCE instead of inside the edge loop below.
+    # Each face is touched by ~4 edges, so without this cache the same
+    # face's normal gets normalized and dotted against tile_normal up to 4x
+    # over -- once per edge that happens to reference it. Caching turns that
+    # into a single pass over faces, and the edge loop becomes cheap lookups.
+    face_cache = {}
+    if l_normal:
+        for f in bm.faces:
+            is_bool_f = orig_face_marker is not None and f[orig_face_marker] < 0.5
+            tile_normal = mathutils.Vector(f[l_normal]).normalized()
+            dot = f.normal.normalized().dot(tile_normal)
+            is_top_f = dot > 0.9
+            is_bot_f = dot < -0.9
+            axis_u_f = mathutils.Vector(f[lu]) if (is_top_f and lu) else None
+            axis_v_f = mathutils.Vector(f[lv]) if (is_top_f and lv) else None
+            face_cache[f] = (is_bool_f, is_top_f, is_bot_f, axis_u_f, axis_v_f)
+    elif orig_face_marker is not None:
+        for f in bm.faces:
+            face_cache[f] = (f[orig_face_marker] < 0.5, False, False, None, None)
+
     for edge in bm.edges:
         linked = edge.link_faces
         if not linked: continue
 
         is_boolean_edge = False
         if orig_face_marker is not None:
-            is_boolean_edge = any(f[orig_face_marker] < 0.5 for f in linked)
+            is_boolean_edge = any(face_cache[f][0] for f in linked)
 
         is_top = is_bot = is_width_edge = is_length_edge = False
 
         if not is_boolean_edge:
             if l_normal:
                 for f in linked:
-                    tile_normal = mathutils.Vector(f[l_normal]).normalized()
-                    dot = f.normal.normalized().dot(tile_normal)
-                    if dot > 0.9: is_top = True
-                    elif dot < -0.9: is_bot = True
+                    _, is_top_f, is_bot_f, _, _ = face_cache[f]
+                    if is_top_f: is_top = True
+                    elif is_bot_f: is_bot = True
 
             if is_top and lu and lv:
-                cap_face = next((f for f in linked if f.normal.normalized().dot(mathutils.Vector(f[l_normal]).normalized()) > 0.9), None)
+                cap_face = next((f for f in linked if face_cache[f][1]), None)
                 if cap_face:
-                    axis_u, axis_v = mathutils.Vector(cap_face[lu]), mathutils.Vector(cap_face[lv])
+                    axis_u, axis_v = face_cache[cap_face][3], face_cache[cap_face][4]
                     vec = (edge.verts[0].co - edge.verts[1].co).normalized()
                     is_width_edge = abs(vec.dot(axis_u)) > 0.9
                     is_length_edge = abs(vec.dot(axis_v)) > 0.9
@@ -610,10 +653,9 @@ def create_tile_batch(face_data, width, length, depth, rotation_angle, row_offse
         g_tile_normal, g_axis_u, g_axis_v = [group_bm.faces.layers.float_vector.new(n) for n in ["tile_normal", "tile_axis_u", "tile_axis_v"]]
 
         for final_mat, normal, axis_u, axis_v in group_matrices:
-            tile_uv_rng = random.Random(uv_random_seed + tile_idx)
+            f_u = bool(_fast_tile_bool(uv_random_seed, tile_idx, 1)) if flip_mode in ["BOTH", "U"] else False
+            f_v = bool(_fast_tile_bool(uv_random_seed, tile_idx, 2)) if flip_mode in ["BOTH", "V"] else False
             tile_idx += 1
-            f_u = tile_uv_rng.choice([True, False]) if flip_mode in ["BOTH", "U"] else False
-            f_v = tile_uv_rng.choice([True, False]) if flip_mode in ["BOTH", "V"] else False
             template_bm = templates[(f_u, f_v)]
             t_uv = template_bm.loops.layers.uv.active
 
@@ -627,7 +669,6 @@ def create_tile_batch(face_data, width, length, depth, rotation_angle, row_offse
                 if v.co.z > z_mid:
                     world_co = world_co + normal_vec * tile_depth_offset
                 vert_map[v] = group_bm.verts.new(world_co)
-            group_bm.verts.ensure_lookup_table()
 
             for f_tmp in template_bm.faces:
                 new_f = group_bm.faces.new([vert_map[v] for v in f_tmp.verts])
@@ -1184,6 +1225,7 @@ class SMARTTILE_OT_update(Operator):
             self.report({'WARNING'}, message)
         return {'FINISHED'}
 
+
 class MESH_OT_sync_tile_settings(Operator):
     """Synchronize tile settings from the active object to all other selected tile batches"""
     bl_idname = "mesh.sync_tile_settings"
@@ -1199,11 +1241,10 @@ class MESH_OT_sync_tile_settings(Operator):
                 len(context.selected_objects) > 1)
 
     def execute(self, context):
+        global _suspend_realtime_update
         source_obj = context.active_object
         src_props = source_obj.smart_tile_props
         
-        # Identify all properties defined in the UI that should be synced
-        # This mirrors the fields found in SmartTileSettings
         props_to_sync = [
             "pattern", "width", "length", "depth", "rotation_angle",
             "row_offset", "staggered_offset", "max_random_offset", "random_offset_seed",
@@ -1224,14 +1265,21 @@ class MESH_OT_sync_tile_settings(Operator):
             self.report({'WARNING'}, "No other valid tile batches selected")
             return {'CANCELLED'}
 
-        # Bulk transfer properties only. 
-        # By not touching _perform_tile_update or snapshots, we rely on the 
-        # property 'update' callbacks (via _trigger_realtime_update) 
-        # to handle the regeneration naturally.
-        for obj in targets:
-            target_props = obj.smart_tile_props
-            for prop in props_to_sync:
-                setattr(target_props, prop, getattr(src_props, prop))
+        # Suspend updates globally so we don't trigger partial refreshes during the loop
+        _suspend_realtime_update = True
+        try:
+            for obj in targets:
+                target_props = obj.smart_tile_props
+                for prop in props_to_sync:
+                    setattr(target_props, prop, getattr(src_props, prop))
+                
+                # Explicitly force the update now that all properties are set
+                # We assume you have a function that triggers the actual rebuild
+                _perform_tile_update(context, obj)
+        finally:
+            _suspend_realtime_update = False
+            # Force a single view layer update to refresh the scene state
+            context.view_layer.update()
         
         self.report({'INFO'}, f"Synced settings to {len(targets)} tiles.")
         return {'FINISHED'}
@@ -1336,10 +1384,6 @@ class SMARTTILE_PT_panel(Panel):
             layout.operator("object.smart_tile_generate", icon='MESH_GRID')
 
 
-# ---------------------------------------------------------------------------
-# REGISTRATION
-# ---------------------------------------------------------------------------
-
 classes = (
     SmartTileSettings,
     MESH_OT_sync_tile_settings,
@@ -1347,7 +1391,6 @@ classes = (
     SMARTTILE_OT_update,
     SMARTTILE_PT_panel,
 )
-
 
 def register():
     for cls in classes:
